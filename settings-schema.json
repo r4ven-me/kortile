@@ -1,0 +1,496 @@
+{
+    "layout1": {
+        "type": "layout",
+        "pages": ["page-general", "page-rules", "page-keys"],
+
+        "page-general": {
+            "type": "page",
+            "title": "General",
+            "sections": ["section-general", "section-geometry", "section-window-tabs", "section-focus-border"]
+        },
+        "page-rules": {
+            "type": "page",
+            "title": "Window Rules",
+            "sections": ["section-rules", "section-workspace-rules"]
+        },
+        "page-keys": {
+            "type": "page",
+            "title": "Keyboard Shortcuts",
+            "sections": ["section-keys-general", "section-keys-layout", "section-keys-window"]
+        },
+
+        "section-general": {
+            "type": "section",
+            "title": "Tiling",
+            "keys": [
+                "enabled",
+                "default-layout",
+                "remember-layout-per-workspace",
+                "remember-floating-window-size-enabled",
+                "alt-drag-move-resize-enabled",
+                "focus-follows-mouse-enabled",
+                "focus-follows-mouse-raise-enabled",
+                "focus-follows-mouse-raise-delay"
+            ]
+        },
+        "section-window-tabs": {
+            "type": "section",
+            "title": "Window Tabs",
+            "keys": [
+                "window-tabs-enabled",
+                "window-tabs-grouping",
+                "window-tabs-min-windows",
+                "window-tabs-style",
+                "window-tabs-position",
+                "window-tabs-side",
+                "window-tabs-stretch",
+                "window-tabs-text-color",
+                "window-tabs-opaque",
+                "window-tabs-custom-colors-enabled",
+                "window-tabs-background-color",
+                "window-tabs-foreground-color"
+            ]
+        },
+        "section-focus-border": {
+            "type": "section",
+            "title": "Focus Border",
+            "keys": ["focus-border-enabled", "focus-border-color", "focus-border-width", "focus-border-hide-maximized"]
+        },
+        "section-geometry": {
+            "type": "section",
+            "title": "Geometry",
+            "keys": ["gap-size", "masters-max", "slaves-max", "proportion-step", "proportion-min"]
+        },
+        "section-rules": {
+            "type": "section",
+            "title": "Ignored windows",
+            "keys": ["ignore-list", "ignore-list-pick"]
+        },
+        "section-workspace-rules": {
+            "type": "section",
+            "title": "Startup workspace",
+            "keys": ["workspace-rules", "workspace-rules-pick"]
+        },
+        "section-keys-general": {
+            "type": "section",
+            "title": "General",
+            "keys": ["kb-toggle", "kb-restore", "kb-reset"]
+        },
+        "section-keys-layout": {
+            "type": "section",
+            "title": "Layout",
+            "keys": [
+                "kb-cycle-next",
+                "kb-cycle-previous",
+                "kb-layout-vertical-left",
+                "kb-layout-vertical-right",
+                "kb-layout-horizontal-top",
+                "kb-layout-horizontal-bottom",
+                "kb-layout-maximized"
+            ]
+        },
+        "section-keys-window": {
+            "type": "section",
+            "title": "Windows",
+            "keys": [
+                "kb-master-increase",
+                "kb-master-decrease",
+                "kb-slave-increase",
+                "kb-slave-decrease",
+                "kb-window-next",
+                "kb-window-previous",
+                "kb-minimized-switcher",
+                "kb-master-make",
+                "kb-toggle-floating",
+                "kb-proportion-increase",
+                "kb-proportion-decrease",
+                "kb-stack-proportion-increase",
+                "kb-stack-proportion-decrease"
+            ]
+        }
+    },
+
+    "enabled": {
+        "type": "switch",
+        "default": true,
+        "description": "Enable tiling"
+    },
+    "default-layout": {
+        "type": "combobox",
+        "default": "vertical-left",
+        "description": "Default layout for new workspaces",
+        "options": {
+            "Vertical - master on the left": "vertical-left",
+            "Vertical - master on the right": "vertical-right",
+            "Horizontal - master on top": "horizontal-top",
+            "Horizontal - master on bottom": "horizontal-bottom",
+            "Maximized": "maximized"
+        }
+    },
+    "remember-layout-per-workspace": {
+        "type": "switch",
+        "default": false,
+        "description": "Remember each workspace/monitor's own layout across restarts",
+        "tooltip": "Off by default: a fresh Cinnamon/applet restart otherwise re-creates every workspace's tiling from scratch with \"Default layout for new workspaces\" above, discarding whatever layout each one was actually last switched to (vertical-left, maximized, ...) - looks like it \"forgets\" and resets everything back to one layout on every restart. Turning this on remembers the layout each (workspace, monitor) pair was last set to and re-applies it the next time that same workspace/monitor needs a fresh tiling manager, instead of always falling back to the default. Keyed by workspace/monitor position, not identity - reordering workspaces between restarts can leave this pointing at the wrong one."
+    },
+    "remembered-layouts": {
+        "type": "generic",
+        "default": "{}"
+    },
+    "remember-floating-window-size-enabled": {
+        "type": "switch",
+        "default": false,
+        "description": "Remember floating/ignored window sizes",
+        "tooltip": "Off by default. When on, kortile remembers the last size (not position) of any window it isn't tiling - explicitly floated (kb-toggle-floating below) or matched by the ignore list (Window Rules page) - keyed by its window class, and applies that remembered size the next time a new window of the same class opens. Meant for apps that don't remember their own window size on their own, this applet's own Settings window among them."
+    },
+    "remembered-floating-window-sizes": {
+        "type": "generic",
+        "default": "{}"
+    },
+    "remembered-window-tab-order": {
+        "type": "generic",
+        "default": "{}"
+    },
+    "alt-drag-move-resize-enabled": {
+        "type": "switch",
+        "default": false,
+        "description": "Alt + drag to move or resize a window",
+        "tooltip": "Alt + left-drag moves the window from anywhere on it. Alt + right-drag resizes it, but needs to actually grab a corner (Mutter itself ignores a click too close to the center - no grab starts at all) - and on a tiled window, only a corner shared with another tile (not the outer screen edge) actually sticks, same rule as dragging a tile's real edge by hand. This is Cinnamon's own built-in WM feature (Settings → Windows → modifier key), this toggle just flips it on/off system-wide - turning it back off here always clears the modifier to none, regardless of what it was before enabling."
+    },
+    "focus-follows-mouse-enabled": {
+        "type": "switch",
+        "default": false,
+        "description": "Focus a window by hovering over it",
+        "tooltip": "This is Cinnamon's own built-in WM feature (Settings → Windows → focus mode), this toggle just flips it on/off - sets focus-mode to \"mouse\" (hovering a window focuses it, and moving off any window onto bare desktop/panel unfocuses everything) while on, back to \"click\" (the default) while off, regardless of what it was set to before enabling. Independent of the \"bring to front\" toggle below - Cinnamon lets you focus a hovered window without necessarily raising it, this is that same choice."
+    },
+    "focus-follows-mouse-raise-enabled": {
+        "type": "switch",
+        "default": false,
+        "description": "Also bring a hovered window to the front",
+        "tooltip": "Cinnamon's own auto-raise pref (Settings → Windows), kept as a separate toggle from \"Focus a window by hovering over it\" above since it's a separate choice there too - focusing a hovered window doesn't necessarily raise it above whatever it's still hiding behind. Only actually does anything while the toggle above is also on (auto-raise only fires for a focus change that happened *without* a click, i.e. hover focus) - Cinnamon itself doesn't enforce that dependency (you can turn this on with the toggle above off and nothing will happen), it's just how the underlying feature works."
+    },
+    "focus-follows-mouse-raise-delay": {
+        "type": "spinbutton",
+        "default": 500,
+        "min": 0,
+        "max": 10000,
+        "step": 100,
+        "units": "ms",
+        "description": "Delay before a hovered window is raised",
+        "tooltip": "Also Cinnamon's own built-in WM feature (Settings → Windows → \"Delay before raising focused window\"), only meaningful while \"Also bring a hovered window to the front\" above is on - this just exposes that same auto-raise-delay pref here instead of needing to go find it in Cinnamon's own Windows settings separately. Applied regardless of either toggle above, same as Cinnamon's own Windows settings panel does it."
+    },
+    "window-tabs-enabled": {
+        "type": "switch",
+        "default": false,
+        "description": "Show a tab strip for windows sharing a slot",
+        "tooltip": "Several windows sharing one slot (extra slaves beyond the visible count, see Geometry below, or every window at once in a maximized layout) normally just stack on top of each other with whichever one happens to be on top the only one visible - this draws a small strip above the slot instead, one button per window, so you can see they're there, hover for its title, and click to switch. See \"Tab grouping\" below for which windows sharing a slot get tabbed together."
+    },
+    "window-tabs-grouping": {
+        "type": "combobox",
+        "default": "app",
+        "description": "Tab grouping",
+        "tooltip": "By application: only tabs together windows of the same app sharing a slot - a slot split between two different apps (a maximized layout shares its single slot between everything; slavesMax can also round several apps onto one slot) stays switchable only via Alt+Tab/the taskbar. All open windows: every window sharing the slot gets a tab, regardless of app - the natural fit for maximized layout, where everything already shares the one slot and would otherwise have no strip of its own at all.",
+        "options": {
+            "By application": "app",
+            "All open windows": "all"
+        }
+    },
+    "window-tabs-min-windows": {
+        "type": "spinbutton",
+        "default": 2,
+        "min": 2,
+        "max": 10,
+        "step": 1,
+        "units": "windows",
+        "description": "Show tabs once a slot has at least this many windows to switch between",
+        "tooltip": "The strip only ever appears once a slot has at least this many windows sharing it, counting only those covered by \"Tab grouping\" above (the current app's, or every window there) - 2 (the default) means as soon as there's anything to switch between at all; raise it to only show a strip once several have piled up there, not just two."
+    },
+    "window-tabs-style": {
+        "type": "combobox",
+        "default": "icons-titles",
+        "description": "Tab strip style",
+        "tooltip": "Icons only keeps the strip compact - hover any button for the window's full title. Icons with titles spells it out in the strip itself instead, truncated if it's long (still available in full via the tooltip either way).",
+        "options": {
+            "Icons only": "icons",
+            "Icons with titles": "icons-titles"
+        }
+    },
+    "window-tabs-position": {
+        "type": "combobox",
+        "default": "center",
+        "description": "Tab strip position",
+        "tooltip": "Where the strip sits along its edge of the slot (see \"Tab strip side\" below for which edge that is). If there are more tabs than comfortably fit, Center/Right fall back to Left rather than running off either edge. Has no effect when \"Stretch tab strip\" is on, since the strip already spans the full width then.",
+        "options": {
+            "Left": "left",
+            "Center": "center",
+            "Right": "right"
+        }
+    },
+    "window-tabs-side": {
+        "type": "combobox",
+        "default": "top",
+        "description": "Tab strip side",
+        "tooltip": "Which edge of the slot the strip sits along, and which edge of the tiled window(s) underneath it gives up space for it.",
+        "options": {
+            "Top": "top",
+            "Bottom": "bottom"
+        }
+    },
+    "window-tabs-stretch": {
+        "type": "switch",
+        "default": false,
+        "description": "Stretch tab strip to fill the slot's full width",
+        "tooltip": "Off (default): the strip is only as wide as its tabs need, positioned per \"Tab strip position\" above. On: the strip always spans the slot's entire width, and its tabs spread out evenly to fill that space instead of clustering together - symmetric either way, regardless of how many tabs there are."
+    },
+    "window-tabs-opaque": {
+        "type": "switch",
+        "default": false,
+        "description": "Solid tab strip background",
+        "tooltip": "Off by default: the strip's background (theme-matched or custom, see below) is slightly translucent. Turn this on for a fully solid, opaque background instead - same color either way, just without the transparency."
+    },
+    "window-tabs-custom-colors-enabled": {
+        "type": "switch",
+        "default": false,
+        "description": "Use custom tab strip colors",
+        "tooltip": "Off by default: the strip's background instead automatically matches whatever color the current Cinnamon theme actually paints the panel, so it belongs to the desktop without needing to be told what theme this is. Turn this on to use the two colors below instead of that."
+    },
+    "window-tabs-background-color": {
+        "type": "colorchooser",
+        "default": "#3b4252",
+        "description": "Tab strip background color",
+        "tooltip": "Only used while \"Use custom tab strip colors\" above is on."
+    },
+    "window-tabs-foreground-color": {
+        "type": "colorchooser",
+        "default": "#ffffff",
+        "description": "Tab strip highlight color",
+        "tooltip": "Tints a tab's hover/focused highlight - only used while \"Use custom tab strip colors\" above is on. See \"Tab text color\" below for the title text itself."
+    },
+    "window-tabs-text-color": {
+        "type": "colorchooser",
+        "default": "#ffffff",
+        "description": "Tab text color",
+        "tooltip": "Color of a tab's title text (Icons with titles style) and, while renaming it, the edit field's text. Independent of \"Use custom tab strip colors\" above - always in effect, regardless of whether the background/highlight are theme-matched or custom."
+    },
+    "focus-border-enabled": {
+        "type": "switch",
+        "default": true,
+        "description": "Highlight the focused window with a border",
+        "tooltip": "Several tiled apps have little or no visible window border of their own to show which one has focus"
+    },
+    "focus-border-color": {
+        "type": "colorchooser",
+        "default": "#03f0ff",
+        "description": "Border color"
+    },
+    "focus-border-width": {
+        "type": "spinbutton",
+        "default": 3,
+        "min": 1,
+        "max": 12,
+        "step": 1,
+        "units": "pixels",
+        "description": "Border width"
+    },
+    "focus-border-hide-maximized": {
+        "type": "switch",
+        "default": true,
+        "description": "Hide the border in maximized layout",
+        "tooltip": "In maximized layout every window fills the whole screen, so a border there just outlines the screen edge for whichever window happens to be focused - true of any window there, master or slave (that split is arbitrary in maximized layout anyway, just whichever order windows were opened in), so this hides it for all of them"
+    },
+    "gap-size": {
+        "type": "spinbutton",
+        "default": 8,
+        "min": 0,
+        "max": 100,
+        "step": 1,
+        "units": "pixels",
+        "description": "Gap between tiled windows and screen edges",
+        "tooltip": "Cinnamon's own panels and docks are already excluded automatically (via the monitor work area), this only adds extra breathing room around tiles"
+    },
+    "masters-max": {
+        "type": "spinbutton",
+        "default": 3,
+        "min": 1,
+        "max": 10,
+        "step": 1,
+        "units": "windows",
+        "description": "Maximum number of master windows",
+        "tooltip": "How many windows the master area can hold before Add Master stops working"
+    },
+    "slaves-max": {
+        "type": "spinbutton",
+        "default": 2,
+        "min": 1,
+        "max": 10,
+        "step": 1,
+        "units": "windows",
+        "description": "Maximum number of visible slave windows",
+        "tooltip": "Extra slave windows beyond this count double up on the visible slots instead of getting their own sliver - cycle window focus (Move focus to next/previous window) to reach the ones sharing a slot"
+    },
+    "proportion-step": {
+        "type": "spinbutton",
+        "default": 0.05,
+        "min": 0.01,
+        "max": 0.3,
+        "step": 0.01,
+        "units": "",
+        "description": "Master/slave proportion step",
+        "tooltip": "How much the master-slave split ratio changes per Increase/Decrease Proportion action"
+    },
+    "proportion-min": {
+        "type": "spinbutton",
+        "default": 0.2,
+        "min": 0.05,
+        "max": 0.45,
+        "step": 0.05,
+        "units": "",
+        "description": "Minimum master/slave proportion",
+        "tooltip": "How far the master-slave split ratio can be pushed towards either edge"
+    },
+    "ignore-list": {
+        "type": "textview",
+        "default": "^Xlet-settings\\.py$\n^Cinnamon-settings\\.py$",
+        "description": "Regular expressions (one per line) matched against window class and title. Matching windows are never tiled.",
+        "tooltip": "Example: ^Steam$\nUse `xprop WM_CLASS` (click a window) to find its class name, or use the button below",
+        "height": 150
+    },
+    "ignore-list-pick": {
+        "type": "button",
+        "description": "Pick a window to exclude...",
+        "callback": "on_pick_window_pressed",
+        "tooltip": "Click this, then click any window on screen to add its class to the list above and untile it immediately"
+    },
+    "workspace-rules": {
+        "type": "textview",
+        "default": "",
+        "description": "One rule per line: \"<workspace number> <regex>\" matched against window class/title. Matching windows are moved to that workspace as soon as they open.",
+        "tooltip": "Example: 2 ^Steam$\nWorkspace numbers are 0-based (the first workspace is 0). Use the button below to pick a window and capture its class and current workspace instead of typing this by hand.",
+        "height": 150
+    },
+    "workspace-rules-pick": {
+        "type": "button",
+        "description": "Pick a window to add a rule...",
+        "callback": "on_pick_workspace_rule_pressed",
+        "tooltip": "Switch to (or move the window to) the workspace you want it to open on, then click this and click the window - its class and current workspace are added as a rule above"
+    },
+
+    "kb-toggle": {
+        "type": "keybinding",
+        "default": "<Control><Shift>t",
+        "description": "Enable/disable tiling"
+    },
+    "kb-restore": {
+        "type": "keybinding",
+        "default": "<Control><Shift>r",
+        "description": "Restore windows to their pre-tiling geometry"
+    },
+    "kb-reset": {
+        "type": "keybinding",
+        "default": "<Control><Shift>BackSpace",
+        "description": "Reset layout to default proportions and master count"
+    },
+    "kb-cycle-next": {
+        "type": "keybinding",
+        "default": "<Control><Shift>Next",
+        "description": "Cycle to the next layout"
+    },
+    "kb-cycle-previous": {
+        "type": "keybinding",
+        "default": "<Control><Shift>Prior",
+        "description": "Cycle to the previous layout"
+    },
+    "kb-layout-vertical-left": {
+        "type": "keybinding",
+        "default": "<Control><Shift>Left",
+        "description": "Activate vertical layout, master on the left"
+    },
+    "kb-layout-vertical-right": {
+        "type": "keybinding",
+        "default": "<Control><Shift>Right",
+        "description": "Activate vertical layout, master on the right"
+    },
+    "kb-layout-horizontal-top": {
+        "type": "keybinding",
+        "default": "<Control><Shift>Up",
+        "description": "Activate horizontal layout, master on top"
+    },
+    "kb-layout-horizontal-bottom": {
+        "type": "keybinding",
+        "default": "<Control><Shift>Down",
+        "description": "Activate horizontal layout, master on bottom"
+    },
+    "kb-layout-maximized": {
+        "type": "keybinding",
+        "default": "<Control><Shift>space",
+        "description": "Activate maximized layout"
+    },
+    "kb-master-increase": {
+        "type": "keybinding",
+        "default": "<Control><Shift>6",
+        "description": "Increase number of master windows"
+    },
+    "kb-master-decrease": {
+        "type": "keybinding",
+        "default": "<Control><Shift>4",
+        "description": "Decrease number of master windows"
+    },
+    "kb-slave-increase": {
+        "type": "keybinding",
+        "default": "<Control><Shift>plus",
+        "description": "Increase number of visible slave windows"
+    },
+    "kb-slave-decrease": {
+        "type": "keybinding",
+        "default": "<Control><Shift>minus",
+        "description": "Decrease number of visible slave windows"
+    },
+    "kb-window-next": {
+        "type": "keybinding",
+        "default": "<Control><Shift>2",
+        "description": "Move focus to the next window"
+    },
+    "kb-window-previous": {
+        "type": "keybinding",
+        "default": "<Control><Shift>8",
+        "description": "Move focus to the previous window"
+    },
+    "kb-minimized-switcher": {
+        "type": "keybinding",
+        "default": "<Control><Shift>m",
+        "description": "Show minimized windows on this workspace",
+        "tooltip": "Opens a small popup listing every minimized window on the current workspace/monitor - useful when everything there happens to be minimized and there's no panel/taskbar left to click on to get any of them back. Up/Down to move the selection, Enter or a click to restore and focus it, Escape or a click elsewhere to close without doing anything. Does nothing if nothing on this workspace is currently minimized."
+    },
+    "kb-master-make": {
+        "type": "keybinding",
+        "default": "<Control><Shift>5",
+        "description": "Make the focused window master"
+    },
+    "kb-toggle-floating": {
+        "type": "keybinding",
+        "default": "<Control><Shift>0",
+        "description": "Toggle floating for the focused window",
+        "tooltip": "Pulls the focused window out of the tile grid, free to move/resize normally, without touching its geometry - other tiled windows close the gap it leaves behind. Press again to put it back, which re-tiles it same as a newly-opened window would be. Not the same as Restore: this doesn't reset geometry and isn't permanent. A Cinnamon keybinding is grabbed globally and wins over whatever the focused app would otherwise do with the same combo, and <Control><Shift>F specifically is exactly what triggered that in VSCode/VSCodium's own \"Search in Files\" - if that's happened to you, it wasn't the app misbehaving, it was this shortcut silently un-tiling the window instead. Pick something not already used by apps you actually use if you rebind it."
+    },
+    "kb-proportion-increase": {
+        "type": "keybinding",
+        "default": "<Control><Shift>3",
+        "description": "Increase master/slave proportion"
+    },
+    "kb-proportion-decrease": {
+        "type": "keybinding",
+        "default": "<Control><Shift>1",
+        "description": "Decrease master/slave proportion"
+    },
+    "kb-stack-proportion-increase": {
+        "type": "keybinding",
+        "default": "<Control><Shift>9",
+        "description": "Grow the focused window against its stack neighbor",
+        "tooltip": "For windows stacked together (multiple masters, or multiple visible slaves) - resizes the boundary between the focused window and its neighbor in the same stack, the same as dragging that boundary with the mouse"
+    },
+    "kb-stack-proportion-decrease": {
+        "type": "keybinding",
+        "default": "<Control><Shift>7",
+        "description": "Shrink the focused window against its stack neighbor"
+    }
+}
