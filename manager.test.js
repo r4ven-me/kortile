@@ -387,6 +387,45 @@ const area = { x: 0, y: 0, w: 1000, h: 800 };
     );
 }
 
+// removeWindow: removing one of *several* masters (mastersMax > 1) must not
+// promote a slave when another master is still left - only a group that
+// drops to zero masters needs backfilling. Confirmed live this was wrong:
+// minimizing one of two windows sharing the master slot pulled an unrelated
+// slave into masters anyway, silently expanding it into the master's shared
+// rect even though the other master already satisfied the group.
+{
+    const mg = new Manager(0, 0, "vertical-left", 3, 3);
+    mg.addWindow("master-1");
+    mg.addWindow("slave-1");
+    mg.addWindow("slave-2");
+    // addWindow unshifts, so slaves is [slave-2, slave-1] here (slave-2
+    // added last, at the front); increaseMaster's own shift() promotes
+    // whichever is at that front - slave-2 - leaving slave-1 as the sole
+    // remaining slave.
+    mg.increaseMaster();
+    assertEqual(mg.masters.length, 2, "two masters before removal");
+    const remainingMaster = mg.masters.find((w) => w !== "slave-2");
+
+    mg.removeWindow("slave-2"); // remove one of the two masters, not the last one
+    assertEqual(mg.masters.length, 1, "exactly one master left");
+    assertEqual(mg.masters[0], remainingMaster, "the other master stays master, untouched");
+    assertEqual(mg.slaves.length, 1, "slave-1 was never promoted - still the only slave");
+    assertEqual(mg.slaves[0], "slave-1", "slave-1 unchanged");
+}
+
+// removeWindow still backfills correctly for the plain single-master case
+// (mastersMax=1, the default) - the fix above only narrows *when* it
+// backfills, it shouldn't stop it from happening at all once masters is
+// genuinely empty.
+{
+    const mg = new Manager(0, 0, "vertical-right", 3, 3);
+    mg.addWindow("A"); // master
+    mg.addWindow("B"); // slave
+    mg.removeWindow("A");
+    assertEqual(mg.masters[0], "B", "B still promoted to master once masters is actually empty");
+    assertEqual(mg.slaves.length, 0, "slaves empty after promotion");
+}
+
 if (failures > 0) {
     console.error(`${failures} check(s) failed`);
     process.exit(1);

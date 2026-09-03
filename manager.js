@@ -97,7 +97,20 @@ class Manager {
         if (i >= 0) {
             this.masters.splice(i, 1);
             this.masterRatios = [];
-            if (this.slaves.length > 0) {
+            // Only backfill from slaves when that leaves *no* master at all -
+            // with mastersMax > 1 (several masters sharing one rect, see
+            // compute()), removing just one of several still leaves the
+            // group with a master, so there's nothing to backfill. Confirmed
+            // live this was wrong before: minimizing one of two windows
+            // sharing the master slot (mastersMax=2) promoted an unrelated
+            // slave into masters anyway, even though the other master was
+            // still right there - the promoted slave then shared the whole
+            // master rect with it (masters "share one rect", see compute()),
+            // silently expanding into space that wasn't its own. Restoring
+            // the minimized window afterward never undid that: addWindow()
+            // just appends another master on top of the now-permanently
+            // wrong split.
+            if (this.masters.length === 0 && this.slaves.length > 0) {
                 this.masters.push(this.slaves.shift());
                 this.slaveRatios = [];
             }
