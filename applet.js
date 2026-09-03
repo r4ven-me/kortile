@@ -1782,17 +1782,28 @@ class KortileApplet extends Applet.IconApplet {
     // anchor against (every member currently minimized, say) - there's
     // nothing real tiled there right now for it to hide behind anyway.
     _restackWindowTabStrip(entry) {
+        const topmost = this._topmostGroupWindow(entry);
+        if (!topmost) {
+            global.window_group.set_child_above_sibling(entry.actor, null);
+            return;
+        }
+        global.window_group.set_child_above_sibling(entry.actor, topmost.get_compositor_private());
+    }
+
+    // Shared by _restackWindowTabStrip (z-order) and _windowTabStripRect
+    // (layout) - whichever of a group's own windows is currently topmost in
+    // real stacking order, the same one _reserveWindowTabSpace itself
+    // already uses to decide which app's tabs to show. null when nothing in
+    // the group has a live compositor actor to anchor against (every member
+    // currently minimized, say).
+    _topmostGroupWindow(entry) {
         const candidates = [];
         for (const win of entry.buttons.keys()) {
             if (win.minimized) continue;
             if (win.get_compositor_private()) candidates.push(win);
         }
-        if (candidates.length === 0) {
-            global.window_group.set_child_above_sibling(entry.actor, null);
-            return;
-        }
-        const topmost = global.display.sort_windows_by_stacking(candidates).pop();
-        global.window_group.set_child_above_sibling(entry.actor, topmost.get_compositor_private());
+        if (candidates.length === 0) return null;
+        return global.display.sort_windows_by_stacking(candidates).pop();
     }
 
     // A user-set name (double-click a tab in "Icons with titles" style, see
@@ -2272,20 +2283,43 @@ class KortileApplet extends Applet.IconApplet {
     // fixed width a *previous* sync left behind (Clutter's own convention
     // for "go back to natural sizing"), needed for toggling the setting
     // back off to actually shrink the strip again rather than leaving it
-    // stuck at whatever width stretch mode last forced.
+    // stuck at whatever width stretch mode last forced. Uses
+    // _windowTabStripRect (the group's real, currently-topmost window
+    // width) rather than entry.rect (the slot kortile originally asked for)
+    // - see there for why those two can differ.
     _layoutWindowTabStrip(entry) {
-        const rect = entry.rect;
-        if (!rect) return;
+        if (!entry.rect) return;
+        const rect = this._windowTabStripRect(entry);
         if (this.windowTabsStretch) {
             entry.actor.set_width(rect.w);
             entry.actor.set_x(rect.x);
-            this._equalizeWindowTabWidths(entry);
+            this._equalizeWindowTabWidths(entry, rect);
         } else {
             entry.actor.set_width(-1);
             for (const btn of entry.buttons.values()) btn.set_width(-1);
             const [, naturalWidth] = entry.actor.get_preferred_width(-1);
             entry.actor.set_x(computeWindowTabStripX(rect.x, rect.w, naturalWidth, this.windowTabsPosition));
         }
+    }
+
+    // A VTE-based terminal (gnome-terminal among them) rounds a requested
+    // resize down to a whole number of character cells before actually
+    // applying it - its real frame_rect can end up narrower than the slot
+    // kortile asked for, with nothing left to notice or correct (the app
+    // itself decided the final size, not a stubborn-app fight kortile can
+    // re-assert its way out of - see _commitGeometryChange). Confirmed live
+    // this left the strip visibly wider than the window sitting under it,
+    // out of step with the focus border, which already tracks the real
+    // window (win.get_frame_rect(), live) rather than the slot. Anchoring
+    // the strip to that same real rect instead keeps both of them agreeing
+    // with each other and with the window itself. Falls back to the slot's
+    // own rect (entry.rect) when there's no live window to measure - same
+    // case _topmostGroupWindow itself already returns null for.
+    _windowTabStripRect(entry) {
+        const topmost = this._topmostGroupWindow(entry);
+        if (!topmost) return entry.rect;
+        const r = topmost.get_frame_rect();
+        return { x: r.x, y: entry.rect.y, w: r.width, h: entry.rect.h };
     }
 
     // Stretch mode used to just give every tab an equal *share of leftover*
@@ -2302,7 +2336,7 @@ class KortileApplet extends Applet.IconApplet {
     // has, rather than cramming everyone into an equally-too-small column -
     // that's also the one regime with the least leftover room to look
     // inconsistent about in the first place.
-    _equalizeWindowTabWidths(entry) {
+    _equalizeWindowTabWidths(entry, rect) {
         const buttons = Array.from(entry.buttons.values());
         if (buttons.length === 0) return;
         for (const btn of buttons) btn.set_width(-1);
@@ -2316,7 +2350,7 @@ class KortileApplet extends Applet.IconApplet {
         const naturals = buttons.map((btn) => btn.get_preferred_width(-1)[1]);
         const naturalTotal = naturals.reduce((a, b) => a + b, 0);
         const [, stripNatural] = entry.actor.get_preferred_width(-1);
-        const available = entry.rect.w;
+        const available = rect.w;
         entry.actor.set_width(available);
         if (stripNatural >= available) return;
         const overhead = stripNatural - naturalTotal; // the strip's own spacing/padding, same regardless of any one tab's width
