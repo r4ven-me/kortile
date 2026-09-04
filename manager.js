@@ -92,6 +92,13 @@ class Manager {
         }
     }
 
+    // Returns where win was removed from ({kind: "master"|"slave", index}),
+    // or null if it wasn't tracked at all - callers that only mean to
+    // *temporarily* pull a window out (minimizing, native maximize/
+    // fullscreen, explicit float, see applet.js) pass this straight back
+    // into restoreWindow() so putting it back doesn't reshuffle every other
+    // window's slot the way addWindow()'s own front-insert would (see
+    // restoreWindow() below).
     removeWindow(win) {
         let i = this.masters.indexOf(win);
         if (i >= 0) {
@@ -114,13 +121,42 @@ class Manager {
                 this.masters.push(this.slaves.shift());
                 this.slaveRatios = [];
             }
-            return;
+            return { kind: "master", index: i };
         }
         i = this.slaves.indexOf(win);
         if (i >= 0) {
             this.slaves.splice(i, 1);
             this.slaveRatios = [];
+            return { kind: "slave", index: i };
         }
+        return null;
+    }
+
+    // Re-inserts win at (approximately) the position a prior removeWindow()
+    // reported it was removed from, instead of addWindow()'s own front-
+    // insert - used when a window that only *temporarily* left (minimized,
+    // native-maximized/fullscreened, explicitly floated) comes back, so it
+    // lands back near its old slot rather than jumping to the front and
+    // shifting every other window's slot along with it. info is whatever
+    // the matching removeWindow() call returned; falls back to addWindow()'s
+    // plain front-insert (still the right call for a genuinely new window)
+    // when there's nothing usable to restore - no info, or its remembered
+    // slot no longer fits (e.g. mastersMax shrunk while it was away).
+    restoreWindow(win, info) {
+        if (this.hasWindow(win)) return;
+        if (info && info.kind === "master" && this.masters.length < this.mastersMax) {
+            const i = Math.max(0, Math.min(info.index, this.masters.length));
+            this.masters.splice(i, 0, win);
+            this.masterRatios = [];
+            return;
+        }
+        if (info && info.kind === "slave") {
+            const i = Math.max(0, Math.min(info.index, this.slaves.length));
+            this.slaves.splice(i, 0, win);
+            this.slaveRatios = [];
+            return;
+        }
+        this.addWindow(win);
     }
 
     allWindows() {

@@ -426,6 +426,68 @@ const area = { x: 0, y: 0, w: 1000, h: 800 };
     assertEqual(mg.slaves.length, 0, "slaves empty after promotion");
 }
 
+// restoreWindow: a slave that temporarily left (minimized, native
+// maximize/fullscreen, explicit float - see applet.js) comes back to its
+// old slot instead of addWindow()'s own front-insert, leaving every other
+// window's slot untouched - this is the fix for restoring a minimized
+// window (e.g. via a taskbar/grouped-window-list click) visibly reshuffling
+// the whole tiled layout instead of just reappearing where it was.
+{
+    const mg = new Manager(0, 0, "vertical-right", 3, 3);
+    mg.addWindow("master"); // master
+    mg.addWindow("A"); // slaves = [A]
+    mg.addWindow("B"); // slaves = [B, A]
+    mg.addWindow("C"); // slaves = [C, B, A]
+    const info = mg.removeWindow("B"); // slaves = [C, A]
+    assertEqual(info.kind, "slave", "B was removed from the slave list");
+    assertEqual(info.index, 1, "B was at slave index 1 before removal");
+    mg.restoreWindow("B", info);
+    assertEqual(mg.slaves.join(","), "C,B,A", "B lands back at its old index, not the front");
+}
+
+// restoreWindow: same idea for a master that temporarily left.
+{
+    const mg = new Manager(0, 0, "vertical-right", 3, 3);
+    mg.addWindow("A"); // master
+    mg.addWindow("B"); // slaves = [B]
+    mg.addWindow("C"); // slaves = [C, B]
+    mg.increaseMaster(); // needs 2+ slaves to promote one - masters = [A, C], slaves = [B]
+    assertEqual(mg.masters.join(","), "A,C", "sanity check on increaseMaster's own result");
+    const info = mg.removeWindow("C"); // masters = [A]
+    assertEqual(info.kind, "master", "C was removed from the master list");
+    assertEqual(info.index, 1, "C was at master index 1 before removal");
+    mg.restoreWindow("C", info);
+    assertEqual(mg.masters.join(","), "A,C", "C lands back in the master list, at its old index");
+}
+
+// restoreWindow: falls back to addWindow()'s front-insert when there's
+// nothing to restore (no info at all) - still the right call for a
+// genuinely new window, which never has a prior removeWindow() to point
+// back to.
+{
+    const mg = new Manager(0, 0, "vertical-right", 3, 3);
+    mg.addWindow("A"); // master
+    mg.addWindow("B"); // slaves = [B]
+    mg.restoreWindow("C", null);
+    assertEqual(mg.slaves.join(","), "C,B", "no info falls back to a plain front-insert");
+}
+
+// restoreWindow: also falls back to a front-insert when the remembered
+// slot no longer fits - e.g. mastersMax shrank back to 1 while a second
+// master was away, so its old master slot isn't available to return to.
+{
+    const mg = new Manager(0, 0, "vertical-right", 3, 3);
+    mg.addWindow("A"); // master
+    mg.addWindow("B"); // slaves = [B]
+    mg.addWindow("C"); // slaves = [C, B]
+    mg.increaseMaster(); // masters = [A, C], slaves = [B]
+    const info = mg.removeWindow("C"); // masters = [A]
+    mg.mastersMax = 1; // simulate the limit shrinking while C was away
+    mg.restoreWindow("C", info);
+    assertEqual(mg.masters.join(","), "A", "master slot no longer fits, so C did not rejoin masters");
+    assertEqual(mg.slaves.join(","), "C,B", "C fell back into the slave list instead");
+}
+
 if (failures > 0) {
     console.error(`${failures} check(s) failed`);
     process.exit(1);

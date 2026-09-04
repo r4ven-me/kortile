@@ -166,7 +166,32 @@ class KortileApplet extends Applet.IconApplet {
         this._enforceTimers = new Map(); // Meta.Window -> GLib timeout id, periodic re-assertion for windows that resist tiling with no user input involved, see _startEnforcing
         this._clipGeneration = new Map(); // Meta.Window -> integer, guards a stale _applyClipWhenSettled poll from clobbering a newer _applyOne call's clip, see _applyOne
         this._floatingWindows = new Set(); // Meta.Window -> explicitly untiled via kb-toggle-floating, see _toggleFloating
+        // Meta.Window -> currently untiled specifically because the user
+        // native-maximized (or fullscreened) an already-tiled window, see
+        // _onWindowMaximizedChanged/_onWindowFullscreenChanged. Same idea as
+        // _floatingWindows - keeps _isTileable() saying no for it - but
+        // scoped separately since it's cleared automatically the moment the
+        // window un-maximizes/un-fullscreens rather than needing an explicit
+        // user toggle back. Without this, _startUntrackedWindowSweep's own
+        // periodic re-check (every 3s, see there) has no way to tell "still
+        // deliberately maximized" apart from "eligible but somehow missed at
+        // creation", and silently re-tracks (and so un-maximizes, see
+        // _commitGeometryChange) it the next time it happens to run - this is
+        // the fix for a maximized tiled window reverting to its tile on its
+        // own a few seconds after the maximize button is clicked.
+        this._nativeMaximizedWindows = new Set();
         this._minimizedWindowManager = new Map(); // Meta.Window -> Manager it was tiled in right before minimizing, see _onWindowMinimizedChanged/_reserveWindowTabSpace
+        // Meta.Window -> {mg, info} it was removed from ({kind, index}, see
+        // manager.js removeWindow/restoreWindow) right before a *temporary*
+        // removal - minimizing, native maximize/fullscreen, explicit float.
+        // _trackWindow consumes this on the way back in so the window lands
+        // back near its old slot via restoreWindow() instead of jumping to
+        // the front the way a plain addWindow() would (see _trackWindow) -
+        // this is the fix for restoring a minimized window (e.g. via the
+        // taskbar/grouped window list) landing it, and shifting every other
+        // window along with it, at the front slot instead of back where it
+        // came from.
+        this._removedWindowPosition = new Map();
         this._pendingTrack = new Set(); // Meta.Window -> created but not tracked yet, see _onWindowCreated
         this._floatingWindowSizes = new Map(); // wm_class -> {w,h}, see remember-floating-window-size-enabled
         this._floatingSizeDebounce = new Map(); // wm_class -> GLib timeout id, see _onFloatingWindowSizeChanged
@@ -715,6 +740,8 @@ class KortileApplet extends Applet.IconApplet {
         this._dragFlag.delete(win);
         this._clipGeneration.delete(win);
         this._floatingWindows.delete(win);
+        this._nativeMaximizedWindows.delete(win);
+        this._removedWindowPosition.delete(win);
         this._windowTabCustomNames.delete(win);
         this._minimizedWindowManager.delete(win);
         this._cancelGeometryDebounce(win);
@@ -1100,6 +1127,18 @@ class KortileApplet extends Applet.IconApplet {
         // anything that would otherwise re-track it (e.g. minimize/restore)
         // until toggled back, see _toggleFloating.
         if (this._floatingWindows.has(win)) return false;
+        // Native-maximized/fullscreened while already tiled - stays untiled
+        // until it un-maximizes/un-fullscreens, same idea as the floating
+        // check just above (see _onWindowMaximizedChanged/
+        // _onWindowFullscreenChanged and _nativeMaximizedWindows itself).
+        // Deliberately not just "win.get_maximized() !== 0" here: that would
+        // also reject a *brand-new* window that simply opens already
+        // maximized, which still needs to pass this check the first time so
+        // _trackWindow forces it into the tile (see _commitGeometryChange's
+        // own unmaximize() call) - this set is only ever populated for a
+        // window _onWindowMaximizedChanged found *already* tracked, never
+        // for one that isn't tracked yet.
+        if (this._nativeMaximizedWindows.has(win)) return false;
         if (win.get_window_type() !== Meta.WindowType.NORMAL) return false;
         if (win.is_skip_taskbar()) return false;
         if (win.get_transient_for()) return false;
@@ -1172,7 +1211,21 @@ class KortileApplet extends Applet.IconApplet {
             this._attachWindowSignals(win);
         }
 
-        mg.addWindow(win);
+        // A window coming back from a *temporary* removal (minimized,
+        // native-maximized/fullscreened, explicitly floated) restores near
+        // its old slot instead of jumping to the front the way addWindow()'s
+        // own front-insert would (see manager.js restoreWindow) - only when
+        // it's rejoining the *same* manager it left; a workspace/monitor
+        // change while it was away means that remembered slot doesn't mean
+        // anything here anymore, so that still falls through to a plain
+        // front-insert.
+        const restore = this._removedWindowPosition.get(win);
+        this._removedWindowPosition.delete(win);
+        if (restore && restore.mg === mg) {
+            mg.restoreWindow(win, restore.info);
+        } else {
+            mg.addWindow(win);
+        }
         // After retiling, not before - confirmed live raising here first and
         // then retiling let a sibling end up back on top anyway (move_resize_frame()
         // on the rest of the manager's windows seems to disturb stacking order
@@ -1217,6 +1270,8 @@ class KortileApplet extends Applet.IconApplet {
         this._dragFlag.clear();
         this._clipGeneration.clear();
         this._floatingWindows.clear();
+        this._nativeMaximizedWindows.clear();
+        this._removedWindowPosition.clear();
         this._minimizedWindowManager.clear();
         this._pendingTrack.clear();
         this._hideFocusBorder();
@@ -3306,6 +3361,8 @@ class KortileApplet extends Applet.IconApplet {
         this._dragFlag.delete(win);
         this._clipGeneration.delete(win);
         this._floatingWindows.delete(win);
+        this._nativeMaximizedWindows.delete(win);
+        this._removedWindowPosition.delete(win);
         this._windowTabCustomNames.delete(win);
         this._minimizedWindowManager.delete(win);
         this._pendingTrack.delete(win);
@@ -3501,7 +3558,7 @@ class KortileApplet extends Applet.IconApplet {
                 // minimized, whichever way that happens (see below, and
                 // _onWindowUnmanaged/_untrackWindow/_untrackAll).
                 this._minimizedWindowManager.set(win, mg);
-                mg.removeWindow(win);
+                this._removedWindowPosition.set(win, { mg, info: mg.removeWindow(win) });
                 this._retile(mg);
             }
         } else {
@@ -3531,7 +3588,7 @@ class KortileApplet extends Applet.IconApplet {
                 // Show its actual fullscreen content, not cropped to the
                 // tile slot it just left.
                 this._clearClip(win);
-                mg.removeWindow(win);
+                this._removedWindowPosition.set(win, { mg, info: mg.removeWindow(win) });
                 this._retile(mg);
             }
         } else {
@@ -3558,7 +3615,11 @@ class KortileApplet extends Applet.IconApplet {
                 // Show its actual maximized content, not cropped to the
                 // tile slot it just left (see _onWindowFullscreenChanged).
                 this._clearClip(win);
-                mg.removeWindow(win);
+                this._removedWindowPosition.set(win, { mg, info: mg.removeWindow(win) });
+                // Marks it as deliberately untiled while it stays maximized,
+                // same as _floatingWindows does for kb-toggle-floating - see
+                // _nativeMaximizedWindows itself for why this is needed.
+                this._nativeMaximizedWindows.add(win);
                 this._retile(mg);
             }
         } else {
@@ -3567,6 +3628,7 @@ class KortileApplet extends Applet.IconApplet {
             // before ever being maximized - passing through a maximized
             // state on the way shouldn't silently pull a floating window
             // back into the grid.
+            this._nativeMaximizedWindows.delete(win);
             this._trackWindow(win, true, true);
         }
         this._updateFocusBorder();
@@ -4384,7 +4446,7 @@ class KortileApplet extends Applet.IconApplet {
     _toggleFloating(win) {
         const mg = this._managerFor(win);
         if (mg) {
-            mg.removeWindow(win);
+            this._removedWindowPosition.set(win, { mg, info: mg.removeWindow(win) });
             this._retile(mg);
             this._floatingWindows.add(win);
             // A tiled window's actor carries a permanent Clutter clip sized
