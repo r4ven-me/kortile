@@ -159,6 +159,14 @@ class KortileApplet extends Applet.IconApplet {
         this._originalGeometry = new Map(); // Meta.Window -> {x,y,w,h}
         this._windowSignals = new Map(); // Meta.Window -> [signal ids]
         this._lastAppliedRect = new Map(); // Meta.Window -> {x,y,w,h}, last geometry *we* applied
+        // Meta.Window -> {x,y,w,h}, last geometry we *asked for* - tracked
+        // separately from _lastAppliedRect (what actually landed) so
+        // _applyOne's own short-circuit can tell "nothing changed, skip"
+        // apart from "still asking for the same thing an app's own size
+        // hints won't let it fully honor" (see there) - those aren't the
+        // same thing for e.g. a window whose resize increments quantize it
+        // a few px short of whatever exact pixel size it's asked for.
+        this._lastRequestedRect = new Map();
         this._geometryDebounce = new Map(); // Meta.Window -> GLib timeout id, see _onWindowGeometryChanged
         this._releasePoll = new Map(); // Meta.Window -> GLib timeout id, see _pollForDragRelease
         this._stubbornCount = new Map(); // Meta.Window -> consecutive resist-the-tile count, see _commitGeometryChange
@@ -736,6 +744,7 @@ class KortileApplet extends Applet.IconApplet {
         this._clearClip(win);
         this._originalGeometry.delete(win);
         this._lastAppliedRect.delete(win);
+        this._lastRequestedRect.delete(win);
         this._stubbornCount.delete(win);
         this._dragFlag.delete(win);
         this._clipGeneration.delete(win);
@@ -1266,6 +1275,7 @@ class KortileApplet extends Applet.IconApplet {
         this._managers.clear();
         this._originalGeometry.clear();
         this._lastAppliedRect.clear();
+        this._lastRequestedRect.clear();
         this._stubbornCount.clear();
         this._dragFlag.clear();
         this._clipGeneration.clear();
@@ -2511,15 +2521,37 @@ class KortileApplet extends Applet.IconApplet {
         // there were: not the tab strip UI itself, the redundant real
         // geometry work for every *other* window in that same manager on
         // every single focus change. Only short-circuits when the window
-        // is already actually sitting where it's being asked to (not just
-        // this applet's own record of it, in case something else moved it
-        // since) - a window that's currently maximized always goes
-        // through in full regardless, so it still gets unmaximized below
-        // even if the tile rect underneath hasn't itself changed.
+        // is already actually sitting where it's being asked to - a window
+        // that's currently maximized always goes through in full
+        // regardless, so it still gets unmaximized below even if the tile
+        // rect underneath hasn't itself changed.
+        //
+        // "Already sitting where it's being asked to" is judged against
+        // _lastAppliedRect (what Mutter actually settled the frame at last
+        // time, read back post-move below), not the bare request - an app
+        // whose own size hints won't let it land on an arbitrary pixel size
+        // (gnome-terminal is the reported case: WM_SIZE_HINTS resize
+        // increments quantize it to whole character-cell rows, so a slot
+        // height that isn't itself a multiple of one row settles a few px
+        // short) would otherwise never match the exact request and so never
+        // short-circuit - re-issuing an identical move_resize_frame() on
+        // every single retile even though nothing meaningful changed, which
+        // for such an app is visible as its own height wobbling on every
+        // focus change even while the computed tile target never moved.
+        // _lastRequestedRect (the bare ask, tracked separately from what
+        // actually landed) is what still catches a *genuinely* new target -
+        // only the reality check below is against what really landed, not
+        // what was asked for. This doesn't close the underlying few-px gap
+        // itself (that's the app's own size hints, outside this applet's
+        // control), just the repeated re-application of it.
+        const lastRequested = this._lastRequestedRect.get(win);
+        const requestUnchanged =
+            lastRequested && lastRequested.x === x && lastRequested.y === y && lastRequested.w === w && lastRequested.h === h;
+        this._lastRequestedRect.set(win, { x, y, w, h });
         const last = this._lastAppliedRect.get(win);
-        if (win.get_maximized() === 0 && last && last.x === x && last.y === y && last.w === w && last.h === h) {
+        if (win.get_maximized() === 0 && requestUnchanged && last) {
             const cur = win.get_frame_rect();
-            if (cur.x === x && cur.y === y && cur.width === w && cur.height === h) return;
+            if (cur.x === last.x && cur.y === last.y && cur.width === last.w && cur.height === last.h) return;
         }
 
         if (win.get_maximized() !== 0) {
@@ -3357,6 +3389,7 @@ class KortileApplet extends Applet.IconApplet {
         this._detachWindowSignals(win);
         this._originalGeometry.delete(win);
         this._lastAppliedRect.delete(win);
+        this._lastRequestedRect.delete(win);
         this._stubbornCount.delete(win);
         this._dragFlag.delete(win);
         this._clipGeneration.delete(win);
@@ -3629,7 +3662,40 @@ class KortileApplet extends Applet.IconApplet {
             // state on the way shouldn't silently pull a floating window
             // back into the grid.
             this._nativeMaximizedWindows.delete(win);
-            this._trackWindow(win, true, true);
+            // Grabbing a maximized window's titlebar and dragging it down
+            // un-maximizes it *as the move grab starts* - Mutter's own
+            // native "unsnap" gesture - with the mouse button still held
+            // for the rest of that same drag. Forcing an immediate
+            // synchronous retile()/move_resize_frame() right here would
+            // snap it straight into its tile slot geometry while Mutter's
+            // own grab is still actively driving that exact window,
+            // fighting the live drag the same way _settleGeometryChange
+            // already goes out of its way to avoid for a plain drag/resize
+            // (see there, and _pollForDragRelease) - a forced geometry
+            // change mid-grab desyncs the grab's own notion of the
+            // window's size/position from reality, which is consistent
+            // with a window left at the wrong (tile) height afterward and
+            // no longer resizing correctly by mouse until released and
+            // re-grabbed. While the button is still held, just track it
+            // into its manager without forcing geometry yet (retile/raise
+            // both false) - the window is still actively moving right now,
+            // so _onWindowGeometryChanged's own debounce/button-held poll
+            // (already connected, see _attachWindowSignals) picks it up
+            // from here and commits the real tile geometry itself, only
+            // once the button is actually released. A genuine discrete
+            // unmaximize (the restore button, a keybinding, no button
+            // held) still retiles immediately as before. Also starts the
+            // same release poll _settleGeometryChange itself relies on
+            // (_pollForDragRelease) as a safety net for the button-held
+            // read being a false positive here (e.g. a double-click
+            // restore briefly reading as held between the two clicks) -
+            // without it, and with no further geometry-changed event ever
+            // arriving to pick this window back up, it would stay tracked
+            // but stuck at its just-unmaximized geometry indefinitely,
+            // instead of ever actually landing in its tile slot.
+            const dragging = this._pointerButtonHeld();
+            this._trackWindow(win, !dragging, !dragging);
+            if (dragging) this._pollForDragRelease(win);
         }
         this._updateFocusBorder();
     }
