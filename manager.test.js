@@ -251,6 +251,57 @@ const area = { x: 0, y: 0, w: 1000, h: 800 };
     );
 }
 
+// swap() carries a group's round-robin slot-mate along with it, not just
+// the two groups actually being dragged - regression test for a real bug
+// in the fix above: with 3 groups sharing 2 visible slots, app1 and app3
+// round-robin-share one slot (app1 the intended drag target's slot-mate,
+// app3 hidden underneath) while app2 has the other slot to itself.
+// Dragging app1 onto app2 must move *both* app1 and app3 to app2's old
+// slot, not leave app3 behind pinned to app1's old slot number - that
+// left-behind case is exactly what a user sees as "the dragged window
+// moves, but the window it was hiding drops into its old spot instead of
+// the window it was actually dropped onto".
+{
+    const mg = new Manager(0, 0, "vertical-right", 1, 2);
+    const key = (w) => w.split("-")[0];
+    mg.addWindow("master");
+    mg.addWindow("app1-a");
+    mg.addWindow("app2-a");
+    mg.addWindow("app3-a");
+
+    const before = mg.compute(area, 10, key);
+    assertEqual(
+        before.get("app1-a").x === before.get("app3-a").x && before.get("app1-a").y === before.get("app3-a").y,
+        true,
+        "sanity check: app1 and app3 start out round-robin-sharing one slot"
+    );
+    const sharedSlotBefore = before.get("app1-a");
+    const app2SlotBefore = before.get("app2-a");
+    assertEqual(
+        sharedSlotBefore.x !== app2SlotBefore.x || sharedSlotBefore.y !== app2SlotBefore.y,
+        true,
+        "sanity check: app2 has the other slot to itself"
+    );
+
+    mg.swap("app1-a", "app2-a", key); // dragging app1 onto app2
+    const after = mg.compute(area, 10, key);
+    assertEqual(
+        after.get("app1-a").x === app2SlotBefore.x && after.get("app1-a").y === app2SlotBefore.y,
+        true,
+        "app1 moved to app2's old slot"
+    );
+    assertEqual(
+        after.get("app3-a").x === app2SlotBefore.x && after.get("app3-a").y === app2SlotBefore.y,
+        true,
+        "app3 followed app1 to app2's old slot instead of staying behind"
+    );
+    assertEqual(
+        after.get("app2-a").x === sharedSlotBefore.x && after.get("app2-a").y === sharedSlotBefore.y,
+        true,
+        "app2 alone now occupies app1/app3's old shared slot"
+    );
+}
+
 // The number of visible slots follows the number of distinct *groups*,
 // not the raw slave count or slavesMax on its own - confirmed live as a
 // real bug: with slavesMax=3 but every slave grouping into a single

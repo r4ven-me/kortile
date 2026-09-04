@@ -250,7 +250,7 @@ class Manager {
         list.length = 0;
         list.push(...result);
 
-        // Trade key1's and key2's *rendered* slot along with their array
+        // Trade key1's and key2's *rendered* slots along with their array
         // block, same as compute() would have derived directly from the
         // reordered array before slaveSlotAssignment existed (see
         // _assignSlaveSlots) - without this, a drag-to-swap between two
@@ -262,13 +262,40 @@ class Manager {
         // cleanup to kick in on its own, so both groups kept rendering in
         // their pre-swap slots forever, no matter how many times the user
         // dragged one onto the other.
+        //
+        // This has to relabel *every* group currently sitting at either
+        // slot number, not just key1's and key2's own entries - key1 or
+        // key2 can itself be round-robin-sharing its slot with a third,
+        // uninvolved group (more groups than visible slots, see
+        // compute()), and a plain two-entry swap left that third group
+        // exactly where it was: pinned to key1's old slot number rather
+        // than following key1 to its new one. Confirmed by report:
+        // dragging window A (silently sharing its slot with hidden window
+        // C) onto B moved A to B's old slot correctly, but left C behind
+        // in A's old slot instead of following it there - from the user's
+        // side, dragging A away made some unrelated window C surface in
+        // A's old spot instead of the intended swap partner B ending up
+        // there. Relabeling the whole slot (everyone at slot1 moves to
+        // slot2 and vice versa) carries C along with A, the same way a
+        // groupmate within key1's own group already does.
         if (list === this.slaves) {
             const slot1 = this.slaveSlotAssignment.get(key1);
             const slot2 = this.slaveSlotAssignment.get(key2);
-            if (slot2 !== undefined) this.slaveSlotAssignment.set(key1, slot2);
-            else this.slaveSlotAssignment.delete(key1);
-            if (slot1 !== undefined) this.slaveSlotAssignment.set(key2, slot1);
-            else this.slaveSlotAssignment.delete(key2);
+            if (slot1 !== undefined && slot2 !== undefined) {
+                for (const [key, slot] of this.slaveSlotAssignment) {
+                    if (slot === slot1) this.slaveSlotAssignment.set(key, slot2);
+                    else if (slot === slot2) this.slaveSlotAssignment.set(key, slot1);
+                }
+            } else {
+                // One side has no assignment yet - shouldn't normally
+                // happen for a window already on screen to drag, but stay
+                // safe: place these two directly and let _assignSlaveSlots
+                // sort out anything still missing on the next compute().
+                if (slot2 !== undefined) this.slaveSlotAssignment.set(key1, slot2);
+                else this.slaveSlotAssignment.delete(key1);
+                if (slot1 !== undefined) this.slaveSlotAssignment.set(key2, slot1);
+                else this.slaveSlotAssignment.delete(key2);
+            }
         }
     }
 
