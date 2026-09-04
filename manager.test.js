@@ -268,6 +268,48 @@ const area = { x: 0, y: 0, w: 1000, h: 800 };
     );
 }
 
+// Slot assignment for round-robin-shared slave groups is stable across
+// compute() calls, not recomputed as plain "i % visible" every time - this
+// is the fix for an unrelated group's window closing silently swapping two
+// *other*, untouched groups' slots with each other. 3 groups, 2 visible
+// slots: g2 and g0 round-robin-share slot 0 (g2 is drawn on top), g1 has
+// slot 1 to itself.
+{
+    const mg = new Manager(0, 0, "vertical-right", 1, 2);
+    const key = (w) => w.split("-")[0];
+    mg.addWindow("master");
+    mg.addWindow("g0-a"); // slaves = [g0-a]
+    mg.addWindow("g1-a"); // slaves = [g1-a, g0-a]
+    mg.addWindow("g2-a"); // slaves = [g2-a, g1-a, g0-a]
+
+    const before = mg.compute(area, 10, key);
+    const g1SlotBefore = before.get("g1-a");
+    const g0SlotBefore = before.get("g0-a");
+    assertEqual(
+        before.get("g2-a").x === g0SlotBefore.x && before.get("g2-a").y === g0SlotBefore.y,
+        true,
+        "sanity check: g2 and g0 start out round-robin-sharing one slot"
+    );
+    assertEqual(
+        g1SlotBefore.x !== g0SlotBefore.x || g1SlotBefore.y !== g0SlotBefore.y,
+        true,
+        "sanity check: g1 has the other slot to itself"
+    );
+
+    mg.removeWindow("g2-a"); // g2's only window closes - slaves = [g1-a, g0-a]
+    const after = mg.compute(area, 10, key);
+    assertEqual(
+        after.get("g1-a").x === g1SlotBefore.x && after.get("g1-a").y === g1SlotBefore.y,
+        true,
+        "g1 stays in its own slot after an unrelated group (g2) closes"
+    );
+    assertEqual(
+        after.get("g0-a").x === g0SlotBefore.x && after.get("g0-a").y === g0SlotBefore.y,
+        true,
+        "g0 stays in its own (shared) slot too, instead of swapping with g1"
+    );
+}
+
 // swap() with no groupKeyFn (or default) is a plain 1-for-1 element swap,
 // unchanged from before groups existed - confirmed against both a
 // same-list (slave/slave) and a cross-list (master/slave) swap.
