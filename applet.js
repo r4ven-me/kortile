@@ -1368,7 +1368,22 @@ class KortileApplet extends Applet.IconApplet {
     // (and separately tab-stripped, see _reserveWindowTabSpace) groups as
     // it had instances, rather than the one shared strip a user switching
     // between them would expect.
+    //
+    // Only actually groups by wm_class when window-tabs are enabled -
+    // _reserveWindowTabSpace is the *only* thing that lets a user reach
+    // whichever window in a shared slot isn't currently on top, and it's
+    // itself a no-op with windowTabsEnabled off (see there). Grouping
+    // unconditionally meant a second window of the same app, opened with
+    // tabs off, silently landed hidden underneath the first one sharing
+    // its exact slot - no strip to switch to it with, nothing visibly
+    // different from it not being tiled at all, reachable only via
+    // Alt+Tab/the taskbar. Returning win itself (rather than any derived
+    // value) as the fallback key is what actually disables grouping here:
+    // every window is its own object, so it's never equal to any other
+    // window's key, giving each one its own slot exactly like two windows
+    // of *different* apps already get.
     _windowGroupKey(win) {
+        if (!this.windowTabsEnabled) return win;
         return win.get_wm_class() || "";
     }
 
