@@ -3809,9 +3809,6 @@ class KortileApplet extends Applet.IconApplet {
     // actually come up instead (polled, since grab-op-end isn't reliable
     // here either), then commit once.
     _settleGeometryChange(win) {
-        global.log(
-            `[kortile-debug] settle "${win.get_wm_class() || "?"}" buttonHeld=${this._pointerButtonHeld()} dragFlag=${this._dragFlag.get(win) === true}`
-        );
         if (this._pointerButtonHeld()) {
             this._pollForDragRelease(win);
             return;
@@ -3866,9 +3863,6 @@ class KortileApplet extends Applet.IconApplet {
         const wasDragged = this._dragFlag.get(win) === true;
         this._dragFlag.delete(win);
         const [pointerX, pointerY] = global.get_pointer();
-        global.log(
-            `[kortile-debug] commit "${win.get_wm_class() || "?"}" wasDragged=${wasDragged} pointer=(${pointerX},${pointerY})`
-        );
 
         // win.get_monitor() picks whichever monitor has the *largest
         // overlap area* with the window's own frame rect (confirmed live
@@ -3895,9 +3889,6 @@ class KortileApplet extends Applet.IconApplet {
         const ws = win.get_workspace();
         const wsIndex = this._wsIndexForMonitor(monIndex, ws ? ws.index() : mg.workspaceIndex);
         if (monIndex !== mg.monitorIndex || wsIndex !== mg.workspaceIndex) {
-            global.log(
-                `[kortile-debug] commit "${win.get_wm_class() || "?"}" monitor/workspace mismatch (monIndex=${monIndex} vs mg=${mg.monitorIndex}, wsIndex=${wsIndex} vs mg=${mg.workspaceIndex}) - reassigning manager, no swap attempted`
-            );
             mg.removeWindow(win);
             this._retile(mg);
             mg = this._getOrCreateManager(wsIndex, monIndex);
@@ -3907,24 +3898,17 @@ class KortileApplet extends Applet.IconApplet {
         }
 
         const last = this._lastAppliedRect.get(win);
-        if (!last) {
-            global.log(`[kortile-debug] commit "${win.get_wm_class() || "?"}" no _lastAppliedRect - bailing`);
-            return;
-        }
+        if (!last) return;
         const cur = win.get_frame_rect();
 
         const sizeChanged = cur.width !== last.w || cur.height !== last.h;
         const posChanged = cur.x !== last.x || cur.y !== last.y;
-        global.log(
-            `[kortile-debug] commit "${win.get_wm_class() || "?"}" sizeChanged=${sizeChanged} posChanged=${posChanged} cur=(${cur.x},${cur.y},${cur.width}x${cur.height}) last=(${last.x},${last.y},${last.w}x${last.h})`
-        );
         if (!sizeChanged && !posChanged) {
             this._stubbornCount.delete(win); // settled exactly where we put it
             return;
         }
 
         if (!wasDragged) {
-            global.log(`[kortile-debug] commit "${win.get_wm_class() || "?"}" not detected as a drag - snapping back to tile`);
             // Nothing the user did caused this - most commonly an app
             // asynchronously moving/resizing itself back to its own
             // preferred geometry a moment after being tiled (confirmed on
@@ -3970,7 +3954,6 @@ class KortileApplet extends Applet.IconApplet {
         }
 
         if (sizeChanged) {
-            global.log(`[kortile-debug] commit "${win.get_wm_class() || "?"}" sizeChanged branch - proportion update, no swap`);
             // Manually resizing a tiled window's edge translates the drag
             // into a proportion change instead of just fighting it back to
             // the old size: either the master/slave divide, or (if there
@@ -3997,9 +3980,6 @@ class KortileApplet extends Applet.IconApplet {
             // hasn't moved between the two, no reason to risk the two
             // decisions disagreeing over a read taken microseconds apart.
             const target = this._windowAtPoint(mg, { x: pointerX, y: pointerY }, win);
-            global.log(
-                `[kortile-debug] commit "${win.get_wm_class() || "?"}" posChanged branch - swap target=${target ? target.get_wm_class() || "?" : "none"}`
-            );
             // Group-aware (see Manager.swap) - dropping onto a window that
             // shares its slot with others (same app, round-robined
             // together) swaps win with that *whole slot*, not just the one

@@ -75,12 +75,6 @@ class Manager {
         this.slaves = [];
         this.masterRatios = []; // per-boundary split within the master stack, see setStackProportion
         this.slaveRatios = []; // per-boundary split within the (visible) slave stack
-        // groupKey -> slot index (0-based, see compute()'s own slaveArea
-        // handling) - which physical visible slot a slave *group* currently
-        // occupies, persisted across compute() calls so an unrelated
-        // group's membership changing elsewhere doesn't reshuffle everyone
-        // else's slot. See _assignSlaveSlots.
-        this.slaveSlotAssignment = new Map();
     }
 
     hasWindow(win) {
@@ -249,27 +243,6 @@ class Manager {
         }
         list.length = 0;
         list.push(...result);
-
-        // Trade key1's and key2's *rendered* slot along with their array
-        // block, same as compute() would have derived directly from the
-        // reordered array before slaveSlotAssignment existed (see
-        // _assignSlaveSlots) - without this, a drag-to-swap between two
-        // slave groups reordered the array correctly but visibly did
-        // nothing: _assignSlaveSlots keeps a group's existing slot
-        // untouched by default (that's the whole point of it - an
-        // unrelated group closing elsewhere shouldn't reshuffle anyone
-        // else), and neither key1 nor key2 ever left the manager for that
-        // cleanup to kick in on its own, so both groups kept rendering in
-        // their pre-swap slots forever, no matter how many times the user
-        // dragged one onto the other.
-        if (list === this.slaves) {
-            const slot1 = this.slaveSlotAssignment.get(key1);
-            const slot2 = this.slaveSlotAssignment.get(key2);
-            if (slot2 !== undefined) this.slaveSlotAssignment.set(key1, slot2);
-            else this.slaveSlotAssignment.delete(key1);
-            if (slot1 !== undefined) this.slaveSlotAssignment.set(key2, slot1);
-            else this.slaveSlotAssignment.delete(key2);
-        }
     }
 
     makeMaster(win) {
@@ -356,7 +329,6 @@ class Manager {
         this.ratio = defaultRatio;
         this.masterRatios = [];
         this.slaveRatios = [];
-        this.slaveSlotAssignment = new Map();
     }
 
     // Returns a Map<win, {x,y,w,h}> for every tracked window.
@@ -438,58 +410,12 @@ class Manager {
             // just gives each of them the full slave area to itself.
             const visible = Math.max(1, Math.min(groupOrder.length, this.slavesMax));
             const slots = splitStackWeighted(slaveArea, visible, gap, stackAxis, this.slaveRatios);
-            const slotForGroup = this._assignSlaveSlots(groupOrder, visible);
-            groupOrder.forEach((key) => {
-                const slot = slots[slotForGroup.get(key)];
+            groupOrder.forEach((key, i) => {
+                const slot = slots[i % visible];
                 for (const w of byGroup.get(key)) result.set(w, slot);
             });
         }
         return result;
-    }
-
-    // Which physical slot (0-based index into compute()'s own `slots`
-    // array) each of this round's slave groups occupies - persisted in
-    // this.slaveSlotAssignment across calls instead of recomputed as plain
-    // `i % visible` every time, which is what compute() used to do
-    // directly. That plain modulo looked stateless but wasn't really: i is
-    // each group's position within *this call's* groupOrder, which shifts
-    // for every group after one that gained or lost its last window (an
-    // earlier group's window closing, say) even though nothing about the
-    // later groups themselves changed - the visible symptom was two
-    // *unrelated* groups (an app closing had nothing to do with either)
-    // trading slots with each other, purely because their index parity
-    // relative to slavesMax happened to flip. A group that already holds a
-    // still-valid slot (< visible) keeps it here regardless of what
-    // happens elsewhere; only a group with no assignment yet - brand new,
-    // or its old slot number no longer exists because slavesMax/the
-    // group count shrank - claims the currently least-occupied slot,
-    // lowest index first on a tie (reduces to the same left-to-right fill
-    // plain round-robin already produced for a fresh manager with no prior
-    // assignment, which is what every existing compute() test exercises).
-    _assignSlaveSlots(groupOrder, visible) {
-        const current = new Set(groupOrder);
-        const assignment = this.slaveSlotAssignment;
-        for (const key of assignment.keys()) {
-            if (!current.has(key)) assignment.delete(key);
-        }
-        const occupancy = new Array(visible).fill(0);
-        for (const [key, slot] of assignment) {
-            if (slot < visible) {
-                occupancy[slot]++;
-            } else {
-                assignment.delete(key); // that slot no longer exists - needs a fresh one below
-            }
-        }
-        for (const key of groupOrder) {
-            if (assignment.has(key)) continue;
-            let best = 0;
-            for (let i = 1; i < visible; i++) {
-                if (occupancy[i] < occupancy[best]) best = i;
-            }
-            assignment.set(key, best);
-            occupancy[best]++;
-        }
-        return assignment;
     }
 }
 
