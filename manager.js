@@ -249,6 +249,27 @@ class Manager {
         }
         list.length = 0;
         list.push(...result);
+
+        // Trade key1's and key2's *rendered* slot along with their array
+        // block, same as compute() would have derived directly from the
+        // reordered array before slaveSlotAssignment existed (see
+        // _assignSlaveSlots) - without this, a drag-to-swap between two
+        // slave groups reordered the array correctly but visibly did
+        // nothing: _assignSlaveSlots keeps a group's existing slot
+        // untouched by default (that's the whole point of it - an
+        // unrelated group closing elsewhere shouldn't reshuffle anyone
+        // else), and neither key1 nor key2 ever left the manager for that
+        // cleanup to kick in on its own, so both groups kept rendering in
+        // their pre-swap slots forever, no matter how many times the user
+        // dragged one onto the other.
+        if (list === this.slaves) {
+            const slot1 = this.slaveSlotAssignment.get(key1);
+            const slot2 = this.slaveSlotAssignment.get(key2);
+            if (slot2 !== undefined) this.slaveSlotAssignment.set(key1, slot2);
+            else this.slaveSlotAssignment.delete(key1);
+            if (slot1 !== undefined) this.slaveSlotAssignment.set(key2, slot1);
+            else this.slaveSlotAssignment.delete(key2);
+        }
     }
 
     makeMaster(win) {
