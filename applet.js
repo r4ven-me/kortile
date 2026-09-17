@@ -10,6 +10,7 @@ const PopupMenu = imports.ui.popupMenu;
 const ExtensionSystem = imports.ui.extension;
 const Tooltips = imports.ui.tooltips;
 const Cinnamon = imports.gi.Cinnamon;
+const Pango = imports.gi.Pango;
 
 const { Manager, LAYOUTS, shrink } = require("./manager");
 const { FocusBorder, FOCUS_BORDER_WINDOW_TYPES } = require("./focus-border");
@@ -2247,6 +2248,13 @@ class KortileApplet extends Applet.IconApplet {
         if (this.windowTabsStyle === "icons-titles") {
             label = new St.Label({ text: this._windowTabTitle(win) });
             label.style = `font-size: ${this.windowTabsFontSize || WINDOW_TAB_FONT_SIZE_DEFAULT}em; color: ${this._windowTabForegroundHex()};`;
+            // Now that _equalizeWindowTabWidths always forces every tab to
+            // the same width (see there), a tab can end up narrower than
+            // its label's natural width - without this, the title would
+            // just render past the button's edge into its neighbor's
+            // instead of truncating in place.
+            label.clutter_text.set_line_wrap(false);
+            label.clutter_text.ellipsize = Pango.EllipsizeMode.END;
             box = new St.BoxLayout();
             box.style = "spacing: 5px;";
             box.add_actor(icon);
@@ -2254,7 +2262,19 @@ class KortileApplet extends Applet.IconApplet {
             child = box;
         }
 
-        const btn = new St.Button({ child, style_class: "kortile-window-tab", reactive: true, track_hover: true });
+        const btn = new St.Button({
+            child,
+            style_class: "kortile-window-tab",
+            reactive: true,
+            track_hover: true,
+            // x_fill stays false below (icon+label kept centered at their
+            // natural size, see that comment) - without this, forcing the
+            // button narrower than that natural size (_equalizeWindowTabWidths
+            // now always does, see there) lets the child render past the
+            // button's own edge into the next tab's instead of getting
+            // clipped in place.
+            clip_to_allocation: true,
+        });
         // Stretch mode: the strip itself already spans the slot's full
         // width (see _layoutWindowTabStrip) - x_expand is what makes the
         // *tabs* share that width out evenly between them (BoxLayout
@@ -2727,14 +2747,15 @@ class KortileApplet extends Applet.IconApplet {
     // of visibly different width whenever there was a lot of room to fill,
     // since a wide natural tab and a narrow one both grew by the same flat
     // amount rather than ending up the same final size. This instead makes
-    // every tab in the strip exactly the same width once there's enough
-    // spare room for all of them to comfortably fit - true equal columns,
-    // not equal *growth*. Below that threshold (many/long tabs already
-    // needing more room than the strip has), every tab keeps its own
-    // natural size instead and the strip overflows exactly like it always
-    // has, rather than cramming everyone into an equally-too-small column -
-    // that's also the one regime with the least leftover room to look
-    // inconsistent about in the first place.
+    // every tab in the strip exactly the same width unconditionally - true
+    // equal columns, not equal *growth*, and not just title-length-dependent
+    // natural sizing either (confirmed live: with several master/slave
+    // windows of different title lengths, tabs visibly varied in width).
+    // Below the room every tab would need at its natural size, this still
+    // divides evenly rather than falling back to natural sizing and
+    // overflowing - _createWindowTabButton's label.clutter_text.ellipsize is
+    // what keeps a squeezed-below-natural tab's title readable instead of
+    // spilling into its neighbor.
     _equalizeWindowTabWidths(entry, rect) {
         const buttons = Array.from(entry.buttons.values());
         if (buttons.length === 0) return;
@@ -2751,9 +2772,8 @@ class KortileApplet extends Applet.IconApplet {
         const [, stripNatural] = entry.actor.get_preferred_width(-1);
         const available = rect.w;
         entry.actor.set_width(available);
-        if (stripNatural >= available) return;
         const overhead = stripNatural - naturalTotal; // the strip's own spacing/padding, same regardless of any one tab's width
-        const equalWidth = Math.floor((available - overhead) / buttons.length);
+        const equalWidth = Math.max(1, Math.floor((available - overhead) / buttons.length));
         for (const btn of buttons) btn.set_width(equalWidth);
     }
 
