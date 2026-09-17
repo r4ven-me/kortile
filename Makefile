@@ -13,13 +13,14 @@ FORK_DIR         := .spice-fork
 SPICE_DIR     := $(FORK_DIR)/$(UUID)
 FILES_DIR     := $(SPICE_DIR)/files/$(UUID)
 
-APPLET_FILES  := applet.js manager.js manager.test.js tabs.js tabs.test.js \
+APPLET_FILES  := applet.js manager.js manager.test.js \
+                 focus-border.js \
                  metadata.json settings-schema.json icon_dark.svg icon_light.svg
 
 .PHONY: help release test spice-clone spice-sync spice-validate spice-diff spice-update spice-commit spice-push spice-publish spice-sync-upstream spice-status spice-clean
 
 help:
-	@echo "  make test               run manager.test.js + tabs.test.js"
+	@echo "  make test               run manager.test.js"
 	@echo "  make release            the everything button: test, commit + push"
 	@echo "                          THIS repo, clone the fork if it isn't yet,"
 	@echo "                          sync it with upstream, then sync/validate/"
@@ -54,13 +55,12 @@ help:
 
 # --- this repo itself --------------------------------------------------------
 
-# manager.js/tabs.js are deliberately Meta/Clutter-free (see their own
-# comments) specifically so they can be checked with plain node, no running
-# Cinnamon needed - the one part of this codebase release can actually
-# verify before pushing anything anywhere.
+# manager.js is deliberately Meta/Clutter-free (see its own comments)
+# specifically so it can be checked with plain node, no running Cinnamon
+# needed - the one part of this codebase release can actually verify before
+# pushing anything anywhere.
 test:
 	node manager.test.js
-	node tabs.test.js
 
 # Publishes a change end to end, the one command that does all of it: run
 # the test suite first (bails out before touching git at all if something's

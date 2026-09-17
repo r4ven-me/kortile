@@ -38,12 +38,12 @@
             "title": "Window Tabs",
             "keys": [
                 "window-tabs-enabled",
-                "window-tabs-grouping",
-                "window-tabs-min-windows",
+                "window-tabs-include-floating-ignored",
+                "window-tabs-auto-minimized-switcher",
                 "window-tabs-style",
-                "window-tabs-position",
                 "window-tabs-side",
-                "window-tabs-stretch",
+                "window-tabs-icon-size",
+                "window-tabs-font-size",
                 "window-tabs-text-color",
                 "window-tabs-opaque",
                 "window-tabs-custom-colors-enabled",
@@ -183,27 +183,19 @@
         "type": "switch",
         "default": false,
         "description": "Show a tab strip for windows sharing a slot",
-        "tooltip": "Several windows sharing one slot (extra slaves beyond the visible count, see Geometry below, or every window at once in a maximized layout) normally just stack on top of each other with whichever one happens to be on top the only one visible - this draws a small strip above the slot instead, one button per window, so you can see they're there, hover for its title, and click to switch. See \"Tab grouping\" below for which windows sharing a slot get tabbed together."
+        "tooltip": "Several windows sharing one slot (extra slaves beyond the visible count, see Geometry below, or every window at once in a maximized layout) normally just stack on top of each other with whichever one happens to be on top the only one visible - this draws a small strip above the slot instead, one button per window, so you can see they're there, hover for its title, and click to switch. Every window in the manager (tiled, plus floating/ignored ones if \"Include floating/ignored windows in tabs\" below is on) shares one strip, spanning the full width - shown once there are at least 2 of them."
     },
-    "window-tabs-grouping": {
-        "type": "combobox",
-        "default": "app",
-        "description": "Tab grouping",
-        "tooltip": "By application: only tabs together windows of the same app sharing a slot - a slot split between two different apps (a maximized layout shares its single slot between everything; slavesMax can also round several apps onto one slot) stays switchable only via Alt+Tab/the taskbar. All open windows: every window sharing the slot gets a tab, regardless of app - the natural fit for maximized layout, where everything already shares the one slot and would otherwise have no strip of its own at all.",
-        "options": {
-            "By application": "app",
-            "All open windows": "all"
-        }
+    "window-tabs-include-floating-ignored": {
+        "type": "switch",
+        "default": false,
+        "description": "Include floating/ignored windows in tabs",
+        "tooltip": "A window pulled out of the grid (kb-toggle-floating), matched by an ignore rule, or just never tileable in the first place (a settings dialog, a log/utility window) is otherwise invisible to the tab strip entirely - easy to lose behind a tiled window with no way to switch back to it. On, such a window joins the strip of whichever manager (workspace/monitor) it's on, if that manager has at least one tiled window - clicking its tab only raises and focuses it, never tiles or un-ignores it. A manager with nothing tiled at all still has no strip regardless of this setting - see \"Auto-show minimized window list\" below for that case."
     },
-    "window-tabs-min-windows": {
-        "type": "spinbutton",
-        "default": 2,
-        "min": 2,
-        "max": 10,
-        "step": 1,
-        "units": "windows",
-        "description": "Show tabs once a slot has at least this many windows to switch between",
-        "tooltip": "The strip only ever appears once a slot has at least this many windows sharing it, counting only those covered by \"Tab grouping\" above (the current app's, or every window there) - 2 (the default) means as soon as there's anything to switch between at all; raise it to only show a strip once several have piled up there, not just two."
+    "window-tabs-auto-minimized-switcher": {
+        "type": "switch",
+        "default": true,
+        "description": "Auto-show minimized window list when nothing is tiled",
+        "tooltip": "If every tiled window on a workspace/monitor ends up minimized, there's nothing left tiled there for the tab strip to attach to - the desktop goes blank with no obvious way back in. On (default), a small list of that workspace/monitor's minimized windows appears on its own the moment that happens, and disappears the instant a tiled window is open there again - unlike the same list opened manually (kb-minimized-switcher, Ctrl+Shift+M by default), it doesn't block clicks/keyboard to the rest of the desktop while shown, it's just there to click. Off disables the auto-show; the manual shortcut still works either way."
     },
     "window-tabs-style": {
         "type": "combobox",
@@ -213,17 +205,6 @@
         "options": {
             "Icons only": "icons",
             "Icons with titles": "icons-titles"
-        }
-    },
-    "window-tabs-position": {
-        "type": "combobox",
-        "default": "center",
-        "description": "Tab strip position",
-        "tooltip": "Where the strip sits along its edge of the slot (see \"Tab strip side\" below for which edge that is). If there are more tabs than comfortably fit, Center/Right fall back to Left rather than running off either edge. Has no effect when \"Stretch tab strip\" is on, since the strip already spans the full width then.",
-        "options": {
-            "Left": "left",
-            "Center": "center",
-            "Right": "right"
         }
     },
     "window-tabs-side": {
@@ -236,11 +217,25 @@
             "Bottom": "bottom"
         }
     },
-    "window-tabs-stretch": {
-        "type": "switch",
-        "default": false,
-        "description": "Stretch tab strip to fill the slot's full width",
-        "tooltip": "Off (default): the strip is only as wide as its tabs need, positioned per \"Tab strip position\" above. On: the strip always spans the slot's entire width, and its tabs spread out evenly to fill that space instead of clustering together - symmetric either way, regardless of how many tabs there are."
+    "window-tabs-icon-size": {
+        "type": "spinbutton",
+        "default": 16,
+        "min": 12,
+        "max": 28,
+        "step": 2,
+        "units": "px",
+        "description": "Tab icon size",
+        "tooltip": "Size of each tab's app icon. Capped at 28px so the strip can't grow into a second toolbar - the strip's own height follows this automatically."
+    },
+    "window-tabs-font-size": {
+        "type": "spinbutton",
+        "default": 0.9,
+        "min": 0.7,
+        "max": 1.3,
+        "step": 0.1,
+        "units": "em",
+        "description": "Tab title font size",
+        "tooltip": "Size of a tab's title text in \"Icons with titles\" style, relative to your Cinnamon theme's own font size (so it still scales with it) - has no effect in \"Icons only\" style. Capped at 1.3em so the strip can't grow into a second toolbar - the strip's own height follows this automatically."
     },
     "window-tabs-opaque": {
         "type": "switch",

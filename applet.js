@@ -12,7 +12,7 @@ const Tooltips = imports.ui.tooltips;
 const Cinnamon = imports.gi.Cinnamon;
 
 const { Manager, LAYOUTS, shrink } = require("./manager");
-const { computeWindowTabStripX } = require("./tabs");
+const { FocusBorder, FOCUS_BORDER_WINDOW_TYPES } = require("./focus-border");
 
 const KEYBINDINGS = [
     { key: "kb-toggle", prop: "kbToggle", action: "toggle" },
@@ -48,11 +48,6 @@ const LAYOUT_LABELS = {
     maximized: "Maximized",
 };
 
-// Fallbacks only - color/width are normally read live from
-// focusBorderColor/focusBorderWidth (Settings), see _applyFocusBorderStyle.
-const FOCUS_BORDER_COLOR_DEFAULT = "#ff8800";
-const FOCUS_BORDER_WIDTH_DEFAULT = 3;
-
 // See _reserveWindowTabSpace/_syncWindowTabStrips - height reserved above a
 // slot for the strip, and the icon size within each tab button.
 // WINDOW_TAB_BUTTON_PADDING is deliberately generous (not just enough to
@@ -66,7 +61,7 @@ const FOCUS_BORDER_WIDTH_DEFAULT = 3;
 // the same fix - showing the real clickable bounds, not just enlarging
 // them.
 // Confirmed live this needs to actually match the strip's own real
-// rendered height (from WINDOW_TAB_ICON_SIZE/WINDOW_TAB_BUTTON_PADDING
+// rendered height (from the configured icon size/WINDOW_TAB_BUTTON_PADDING
 // below plus the strip's own padding) - it used to just be a guess (28)
 // short of the true value (34px in "Icons with titles" style, whose label
 // is taller than the icon; 30px in icons-only), so the strip's own bottom
@@ -75,9 +70,14 @@ const FOCUS_BORDER_WIDTH_DEFAULT = 3;
 // _updateFocusBorder) land inside the strip's real bounds even after
 // accounting for the border's own outset. Matches the taller ("Icons with
 // titles") case so both styles always have at least enough room, not
-// exactly the same room.
-const WINDOW_TAB_STRIP_HEIGHT = 34;
-const WINDOW_TAB_ICON_SIZE = 16;
+// exactly the same room. WINDOW_TAB_STRIP_HEIGHT_DEFAULT/_ICON_SIZE_DEFAULT/
+// _FONT_SIZE_DEFAULT are that calibration's own baseline (icon size 16,
+// label font 0.9em) - see _windowTabStripHeight(), which scales the real
+// (settings-driven) strip height from it as windowTabsIconSize/
+// windowTabsFontSize move away from these defaults.
+const WINDOW_TAB_STRIP_HEIGHT_DEFAULT = 34;
+const WINDOW_TAB_ICON_SIZE_DEFAULT = 16;
+const WINDOW_TAB_FONT_SIZE_DEFAULT = 0.9;
 const WINDOW_TAB_BUTTON_PADDING = 5;
 const WINDOW_TAB_TITLE_MAX_CHARS = 28;
 // Below this, a press+release is a click (or the second half of a
@@ -85,9 +85,13 @@ const WINDOW_TAB_TITLE_MAX_CHARS = 28;
 // click's own small amount of incidental pointer jitter between press and
 // release should never be misread as the start of a drag.
 const WINDOW_TAB_DRAG_THRESHOLD = 6;
+// _applyClipWhenSettled's own required run of consecutive matching 25ms
+// samples before it trusts an actor's geometry enough to clip it - see its
+// own comment for why one match alone isn't enough.
+const REQUIRED_STABLE_TICKS = 3;
 
 // Minimized-window switcher (see _openMinimizedSwitcher) - a row's icon is
-// deliberately bigger than a tab button's (WINDOW_TAB_ICON_SIZE) since this
+// deliberately bigger than a tab button's default (windowTabsIconSize) since this
 // popup has no strip slot height to stay within, and title/tooltip aren't
 // the only way to read a row here the way they are for icons-only tabs.
 const MINIMIZED_SWITCHER_ICON_SIZE = 24;
@@ -102,20 +106,6 @@ const MINIMIZED_SWITCHER_MIN_WIDTH = 260;
 // hexToRgba with whichever alpha windowTabsOpaque calls for, same as the
 // other two branches there.
 const WINDOW_TAB_BACKGROUND_FALLBACK_HEX = "#3b4252";
-
-// Window types a focused window actually looks like "a window" for border
-// purposes - a right-click context menu becoming global.display.focus_window
-// (confirmed live: Telegram's own context menu reports as OVERRIDE_OTHER
-// while focused) shouldn't get outlined just because it briefly held focus,
-// same for any other transient menu/tooltip/dnd-icon type. DIALOG/MODAL_DIALOG/
-// UTILITY are kept since those are genuine windows a user works in (a "Save
-// As" dialog, a tool palette), same as any other floating window.
-const FOCUS_BORDER_WINDOW_TYPES = [
-    Meta.WindowType.NORMAL,
-    Meta.WindowType.DIALOG,
-    Meta.WindowType.MODAL_DIALOG,
-    Meta.WindowType.UTILITY,
-];
 
 function rectFromMeta(r) {
     return { x: r.x, y: r.y, w: r.width, h: r.height };
@@ -156,40 +146,111 @@ class KortileApplet extends Applet.IconApplet {
         this.uuid = metadata.uuid;
 
         this._managers = new Map(); // "wsIndex:monIndex" -> Manager
-        this._originalGeometry = new Map(); // Meta.Window -> {x,y,w,h}
-        this._windowSignals = new Map(); // Meta.Window -> [signal ids]
-        this._lastAppliedRect = new Map(); // Meta.Window -> {x,y,w,h}, last geometry *we* applied
-        // Meta.Window -> {x,y,w,h}, last geometry we *asked for* - tracked
-        // separately from _lastAppliedRect (what actually landed) so
+        // Meta.Window -> {signalIds, originalGeometry, lastAppliedRect,
+        // lastRequestedRect, geometryDebounce, releasePoll, enforceTimer,
+        // clipGeneration, stubbornCount, dragFlag, floating, nativeMaximized,
+        // minimizedManager, removedInfo, customTabName}.
+        // One record per tracked window instead of fifteen separate
+        // Maps/Sets (_windowSignals, _originalGeometry, _lastAppliedRect,
+        // _lastRequestedRect, _geometryDebounce, _releasePoll,
+        // _enforceTimers, _clipGeneration, _stubbornCount, _dragFlag,
+        // _floatingWindows, _nativeMaximizedWindows, _minimizedWindowManager,
+        // _removedWindowPosition, _windowTabCustomNames, pre-refactor) -
+        // having them in one place means untracking a window
+        // (_untrackWindow/_onWindowUnmanaged/_untrackAll) only has one
+        // entry to drop instead of fifteen, each of which used to need its
+        // own explicit .delete()/.clear() call kept in sync by hand.
+        // _pendingTrack (below) deliberately stays a separate Set instead of
+        // joining this - it tracks a window in the gap *before* it's ever
+        // decided whether the window gets a _windowState entry at all (see
+        // _onWindowCreated), not a subset/superset of this record's own
+        // lifetime the way everything else folded in here is.
+        // Created once in _trackWindow's first-time branch,
+        // deleted together whenever a window stops being tracked at all -
+        // except the three GLib-timer fields below, which have to be read
+        // and explicitly cancelled *before* that deletion (see
+        // _untrackWindow/_onWindowUnmanaged/_untrackAll), or the timer id
+        // is lost and the timer only self-cancels on its own next tick
+        // instead of right away.
+        //
+        // signalIds: [signal ids] connected on this window, see
+        // _attachWindowSignals/_detachWindowSignals.
+        //
+        // originalGeometry: {x,y,w,h} the window had right before it was
+        // first ever tiled - captured once, the first time a window is
+        // tracked (see on_applet_removed_from_panel for why that has to stay
+        // "once", not re-captured on every (re)track), used by "Restore" to
+        // put windows back roughly where they started.
+        //
+        // lastAppliedRect: {x,y,w,h}, last geometry *we* applied - read back
+        // from Mutter after move_resize_frame() actually settled, see
+        // _applyOne/_commitGeometryChange.
+        //
+        // lastRequestedRect: {x,y,w,h}, last geometry we *asked for* -
+        // tracked separately from lastAppliedRect (what actually landed) so
         // _applyOne's own short-circuit can tell "nothing changed, skip"
         // apart from "still asking for the same thing an app's own size
         // hints won't let it fully honor" (see there) - those aren't the
         // same thing for e.g. a window whose resize increments quantize it
         // a few px short of whatever exact pixel size it's asked for.
-        this._lastRequestedRect = new Map();
-        this._geometryDebounce = new Map(); // Meta.Window -> GLib timeout id, see _onWindowGeometryChanged
-        this._releasePoll = new Map(); // Meta.Window -> GLib timeout id, see _pollForDragRelease
-        this._stubbornCount = new Map(); // Meta.Window -> consecutive resist-the-tile count, see _commitGeometryChange
-        this._dragFlag = new Map(); // Meta.Window -> true if a mouse button was held at any point during the current unsettled geometry burst, see _onWindowGeometryChanged
-        this._enforceTimers = new Map(); // Meta.Window -> GLib timeout id, periodic re-assertion for windows that resist tiling with no user input involved, see _startEnforcing
-        this._clipGeneration = new Map(); // Meta.Window -> integer, guards a stale _applyClipWhenSettled poll from clobbering a newer _applyOne call's clip, see _applyOne
-        this._floatingWindows = new Set(); // Meta.Window -> explicitly untiled via kb-toggle-floating, see _toggleFloating
-        // Meta.Window -> currently untiled specifically because the user
+        //
+        // geometryDebounce: GLib timeout id, see _onWindowGeometryChanged.
+        //
+        // releasePoll: GLib timeout id, see _pollForDragRelease.
+        //
+        // enforceTimer: GLib timeout id, periodic re-assertion for windows
+        // that resist tiling with no user input involved, see _startEnforcing.
+        //
+        // clipGeneration: integer, guards a stale _applyClipWhenSettled poll
+        // from clobbering a newer _applyOne call's clip, see _applyOne.
+        //
+        // stubbornCount: {count, lastAt} - consecutive resist-the-tile
+        // count, see _commitGeometryChange.
+        //
+        // dragFlag: true if a mouse button was held at any point during the
+        // current unsettled geometry burst, see _onWindowGeometryChanged.
+        //
+        // floating: explicitly untiled via kb-toggle-floating, see
+        // _toggleFloating.
+        //
+        // nativeMaximized: currently untiled specifically because the user
         // native-maximized (or fullscreened) an already-tiled window, see
         // _onWindowMaximizedChanged/_onWindowFullscreenChanged. Same idea as
-        // _floatingWindows - keeps _isTileable() saying no for it - but
-        // scoped separately since it's cleared automatically the moment the
-        // window un-maximizes/un-fullscreens rather than needing an explicit
-        // user toggle back. Without this, _startUntrackedWindowSweep's own
-        // periodic re-check (every 3s, see there) has no way to tell "still
-        // deliberately maximized" apart from "eligible but somehow missed at
-        // creation", and silently re-tracks (and so un-maximizes, see
-        // _commitGeometryChange) it the next time it happens to run - this is
-        // the fix for a maximized tiled window reverting to its tile on its
-        // own a few seconds after the maximize button is clicked.
-        this._nativeMaximizedWindows = new Set();
-        this._minimizedWindowManager = new Map(); // Meta.Window -> Manager it was tiled in right before minimizing, see _onWindowMinimizedChanged/_reserveWindowTabSpace
-        // Meta.Window -> {mg, info} it was removed from ({kind, index}, see
+        // floating - keeps _isTileable() saying no for it - but cleared
+        // automatically the moment the window un-maximizes/un-fullscreens
+        // rather than needing an explicit user toggle back. Without this,
+        // _startUntrackedWindowSweep's own periodic re-check (every 3s, see
+        // there) has no way to tell "still deliberately maximized" apart
+        // from "eligible but somehow missed at creation", and silently
+        // re-tracks (and so un-maximizes, see _commitGeometryChange) it the
+        // next time it happens to run - this is the fix for a maximized
+        // tiled window reverting to its tile on its own a few seconds after
+        // the maximize button is clicked.
+        //
+        // minimizedManager: Manager it was tiled in right before minimizing,
+        // see _onWindowMinimizedChanged/_reserveWindowTabSpace.
+        //
+        // minimizedExtraManager: Manager whose tab strip a *floating*
+        // window was showing an extra tab in right before minimizing (see
+        // window-tabs-include-floating-ignored) - null otherwise. Same idea
+        // as minimizedManager, but for a window _managerFor no longer finds
+        // (floating already removed it from its manager, see
+        // _toggleFloating), so _onWindowMinimizedChanged sets this instead.
+        // Ignore-listed windows need the same "keep the tab while
+        // minimized" treatment but have no _windowState entry to hold it in
+        // - see _extraWindowWatch.
+        //
+        // lastExtraManager: Manager whose tab strip this window (floating)
+        // most recently showed a *live* extra tab in, kept fresh on every
+        // _collectExtraTabWindows pass regardless of minimized state - see
+        // there. Exists only so _onWindowUnmanaged has something reliable to
+        // retile when this window closes: by the time the "unmanaged"
+        // signal fires, win.get_workspace()/get_monitor() can no longer be
+        // trusted, so re-deriving the manager from the window itself at
+        // that point silently failed and left a dead tab stuck in the
+        // strip until something unrelated retiled it next.
+        //
+        // removedInfo: {mg, info} it was removed from ({kind, index}, see
         // manager.js removeWindow/restoreWindow) right before a *temporary*
         // removal - minimizing, native maximize/fullscreen, explicit float.
         // _trackWindow consumes this on the way back in so the window lands
@@ -199,7 +260,12 @@ class KortileApplet extends Applet.IconApplet {
         // taskbar/grouped window list) landing it, and shifting every other
         // window along with it, at the front slot instead of back where it
         // came from.
-        this._removedWindowPosition = new Map();
+        //
+        // customTabName: a user-set name (double-click a tab in "Icons with
+        // titles" style, see _startWindowTabRename) that overrides the
+        // window's own title everywhere a tab shows text for it - label and
+        // tooltip alike - until cleared (empty rename) or the window closes.
+        this._windowState = new Map();
         this._pendingTrack = new Set(); // Meta.Window -> created but not tracked yet, see _onWindowCreated
         this._floatingWindowSizes = new Map(); // wm_class -> {w,h}, see remember-floating-window-size-enabled
         this._floatingSizeDebounce = new Map(); // wm_class -> GLib timeout id, see _onFloatingWindowSizeChanged
@@ -208,32 +274,31 @@ class KortileApplet extends Applet.IconApplet {
         this._kbNames = [];
         this._retiling = false; // re-entrancy guard, see _retile()
 
-        this._focusBorderWin = null; // Meta.Window currently outlined, if any
-        this._focusBorderSignalIds = []; // signal ids connected on _focusBorderWin for live repositioning, see _onFocusWindowChanged
-        this._focusBorder = new St.Bin({ style_class: "kortile-focus-border", reactive: false });
-        Main.uiGroup.add_actor(this._focusBorder);
-        // Pin it directly above the window layer (global.window_group is
-        // Main.uiGroup's own bottommost child - every other actor there is
-        // some kind of chrome: panels, menus, notifications, OSDs...) so it
-        // renders over the focused window but never over any of that.
-        // Plain add_actor() alone leaves it wherever it happens to land in
-        // uiGroup's sibling order at whatever point kortile itself got
-        // added there - confirmed live that can and does end up *above*
-        // various chrome (kortile's own panel menu the first time this was
-        // reported, then a right-click desktop/panel menu next), since
-        // nothing else ever revisits that position afterward.
-        Main.uiGroup.set_child_above_sibling(this._focusBorder, global.window_group);
-        this._focusBorder.hide();
+        // Owns its own actor + Meta.Window signal hookup, see focus-border.js.
+        this._focusBorder = new FocusBorder(this);
 
         this._windowTabGroups = new Map(); // groupKey ("ws:mon:rectKey:wmClass") -> {actor, buttons: Map<Meta.Window, St.Button>}, see _syncWindowTabStrips
-        this._windowTabCustomNames = new Map(); // Meta.Window -> string, user-set via double-click rename, see _startWindowTabRename
         this._windowTabOrder = new Map(); // groupKey -> Meta.Window[], user-set via drag-reorder, see _commitWindowTabDragOrder
         this._pendingWindowTabOrder = new Map(); // groupKey -> stable_sequence[], persisted order not yet matched back to real windows this session, see _orderWindowTabGroup
         this._windowTabDragGroupKey = null; // groupKey currently mid-drag, see _startWindowTabDrag - _syncWindowTabStrips leaves this one group's button order alone while set, rather than fighting the live drag back to its last-committed order
         this._windowTabRestackRecheckId = null; // GLib timeout id, see _onWindowsRestacked
         this._untrackedSweepId = null; // GLib timeout id, see _startUntrackedWindowSweep
+        // Meta.Window -> {signalIds, minimizedExtraManager} - lightweight
+        // side tracking for ignore-listed windows shown as an extra tab
+        // (window-tabs-include-floating-ignored), which otherwise have no
+        // _windowState entry and no signals connected at all (_trackWindow
+        // no-ops for anything _isTileable rejects). Exists purely so such a
+        // window minimizing can still keep its tab, the same way a tiled
+        // window's minimizedManager does - see _watchExtraWindowForMinimize/
+        // _collectExtraTabWindows.
+        this._extraWindowWatch = new Map();
 
         this._minimizedSwitcher = null; // {actor, rows: [{actor, win}], selectedIndex, capturedId}, see _openMinimizedSwitcher
+        // Manager -> St.BoxLayout actor, the non-modal auto-shown sibling of
+        // the modal popup above - one per manager currently showing it
+        // (unlike _minimizedSwitcher, several can be up at once, one per
+        // empty-of-tiled-windows monitor) - see _updateAutoMinimizedSwitcher.
+        this._autoMinimizedSwitchers = new Map();
 
         this._applyTrayIcon(metadata.path);
         // Re-reads the panel background and swaps light/dark icon files if
@@ -331,12 +396,20 @@ class KortileApplet extends Applet.IconApplet {
         );
         this._applyFocusBorderStyle();
         this._settings.bind("window-tabs-enabled", "windowTabsEnabled", this._onWindowTabsSettingChanged.bind(this));
-        this._settings.bind("window-tabs-grouping", "windowTabsGrouping", this._onWindowTabsSettingChanged.bind(this));
-        this._settings.bind("window-tabs-min-windows", "windowTabsMinWindows", this._onWindowTabsSettingChanged.bind(this));
+        this._settings.bind(
+            "window-tabs-include-floating-ignored",
+            "windowTabsIncludeFloatingIgnored",
+            this._onWindowTabsSettingChanged.bind(this)
+        );
+        this._settings.bind(
+            "window-tabs-auto-minimized-switcher",
+            "windowTabsAutoMinimizedSwitcher",
+            this._onWindowTabsSettingChanged.bind(this)
+        );
         this._settings.bind("window-tabs-style", "windowTabsStyle", this._onWindowTabsSettingChanged.bind(this));
-        this._settings.bind("window-tabs-position", "windowTabsPosition", this._onWindowTabsSettingChanged.bind(this));
         this._settings.bind("window-tabs-side", "windowTabsSide", this._onWindowTabsSettingChanged.bind(this));
-        this._settings.bind("window-tabs-stretch", "windowTabsStretch", this._onWindowTabsSettingChanged.bind(this));
+        this._settings.bind("window-tabs-icon-size", "windowTabsIconSize", this._onWindowTabsSettingChanged.bind(this));
+        this._settings.bind("window-tabs-font-size", "windowTabsFontSize", this._onWindowTabsSettingChanged.bind(this));
         this._settings.bind("window-tabs-opaque", "windowTabsOpaque", this._onWindowTabsSettingChanged.bind(this));
         this._settings.bind(
             "window-tabs-custom-colors-enabled",
@@ -456,7 +529,7 @@ class KortileApplet extends Applet.IconApplet {
         if (this._themeSetId) Main.themeManager.disconnect(this._themeSetId);
         // Not a restore: this also runs on every reload (ReloadXlet, a
         // Cinnamon session restart, editing the applet), which should be
-        // seamless. _originalGeometry is captured once, the first time a
+        // seamless. originalGeometry is captured once, the first time a
         // window is ever tracked - if it's since been dragged to a
         // different monitor (which now works, see _commitGeometryChange),
         // restoring on every reload would snap it back to that stale spawn
@@ -734,7 +807,7 @@ class KortileApplet extends Applet.IconApplet {
     // should stop being tiled while it (or the applet) is still alive -
     // added to the ignore list, or explicitly restored - so it can't
     // silently get swept back into the tile by the next unrelated retile
-    // with stale bookkeeping (a stale _lastAppliedRect in particular could
+    // with stale bookkeeping (a stale lastAppliedRect in particular could
     // misread the restored position as a swap or resize against whatever
     // it used to be). Doesn't retile the vacated manager itself - callers
     // that want the remaining windows to fill the gap do that themselves.
@@ -742,20 +815,13 @@ class KortileApplet extends Applet.IconApplet {
         mg.removeWindow(win);
         this._detachWindowSignals(win);
         this._clearClip(win);
-        this._originalGeometry.delete(win);
-        this._lastAppliedRect.delete(win);
-        this._lastRequestedRect.delete(win);
-        this._stubbornCount.delete(win);
-        this._dragFlag.delete(win);
-        this._clipGeneration.delete(win);
-        this._floatingWindows.delete(win);
-        this._nativeMaximizedWindows.delete(win);
-        this._removedWindowPosition.delete(win);
-        this._windowTabCustomNames.delete(win);
-        this._minimizedWindowManager.delete(win);
+        // These three read/cancel their GLib source id out of _windowState -
+        // has to run before the delete() below, or the id is gone and the
+        // timer only self-cancels on its own next tick instead of right now.
         this._cancelGeometryDebounce(win);
         this._stopEnforcing(win);
         this._cancelDragReleasePoll(win);
+        this._windowState.delete(win);
         // Not hiding the focus border here even if win is currently
         // outlined: the border also covers focused non-tiled windows (see
         // _updateFocusBorder), so a window that just stopped being tiled
@@ -1118,6 +1184,23 @@ class KortileApplet extends Applet.IconApplet {
         return null;
     }
 
+    // Which manager a window's own tab strip would belong to, purely by
+    // workspace/monitor - unlike _managerFor, this doesn't require the
+    // window to actually be tiled there. Used for floating/ignored windows
+    // in _collectExtraTabWindows and by the minimize bookkeeping in
+    // _onWindowMinimizedChanged/_onExtraWindowMinimizedChanged that keeps
+    // their tab alive while minimized (see window-tabs-include-floating-
+    // ignored).
+    _extraTabManagerFor(win) {
+        const ws = win.get_workspace();
+        const monIndex = win.get_monitor();
+        const wsIndex = this._wsIndexForMonitor(
+            monIndex,
+            ws ? ws.index() : global.workspace_manager.get_active_workspace_index()
+        );
+        return this._managers.get(`${wsIndex}:${monIndex}`) || null;
+    }
+
     _activeManager() {
         const monIndex = Main.layoutManager.currentMonitor.index;
         const wsIndex = this._wsIndexForMonitor(monIndex, global.workspace_manager.get_active_workspace_index());
@@ -1135,11 +1218,11 @@ class KortileApplet extends Applet.IconApplet {
         // Explicitly floated via kb-toggle-floating - stays untiled through
         // anything that would otherwise re-track it (e.g. minimize/restore)
         // until toggled back, see _toggleFloating.
-        if (this._floatingWindows.has(win)) return false;
+        if (this._windowState.get(win)?.floating) return false;
         // Native-maximized/fullscreened while already tiled - stays untiled
         // until it un-maximizes/un-fullscreens, same idea as the floating
         // check just above (see _onWindowMaximizedChanged/
-        // _onWindowFullscreenChanged and _nativeMaximizedWindows itself).
+        // _onWindowFullscreenChanged and the nativeMaximized field itself).
         // Deliberately not just "win.get_maximized() !== 0" here: that would
         // also reject a *brand-new* window that simply opens already
         // maximized, which still needs to pass this check the first time so
@@ -1147,7 +1230,22 @@ class KortileApplet extends Applet.IconApplet {
         // own unmaximize() call) - this set is only ever populated for a
         // window _onWindowMaximizedChanged found *already* tracked, never
         // for one that isn't tracked yet.
-        if (this._nativeMaximizedWindows.has(win)) return false;
+        if (this._windowState.get(win)?.nativeMaximized) return false;
+        if (!this._isStructurallyEligible(win)) return false;
+        if (this._matchesIgnoreList(win)) return false;
+        return true;
+    }
+
+    // Tiling eligibility only - is this even the *kind* of window kortile
+    // would ever tile at all, regardless of the floating/native-maximized/
+    // ignore-list reasons _isTileable itself also checks. Deliberately not
+    // shared with _isWindowTabEligible (the equivalent gate for the tab-
+    // strip's own, separate "can this non-tiled window still get a tab"
+    // question) - that one needs a broader window-type allowlist (DIALOG/
+    // UTILITY windows are never tiled but are still real, switchable
+    // windows) and skips the ignore-list check entirely, so the two checks
+    // would only pretend to be the same thing if forced to share this body.
+    _isStructurallyEligible(win) {
         if (win.get_window_type() !== Meta.WindowType.NORMAL) return false;
         if (win.is_skip_taskbar()) return false;
         if (win.get_transient_for()) return false;
@@ -1173,8 +1271,42 @@ class KortileApplet extends Applet.IconApplet {
         ) {
             return false;
         }
+        return true;
+    }
 
-        if (this._matchesIgnoreList(win)) return false;
+    // The mirror image of _isTileable's own ignore-list check: true for a
+    // window that would otherwise be perfectly eligible but is excluded
+    // specifically by an ignore rule - used by _collectExtraTabWindows
+    // (window-tabs-include-floating-ignored) to find ignored windows worth
+    // giving a tab to, without also sweeping in things _isTileable already
+    // excludes for unrelated reasons (a transient dialog, a skip-taskbar
+    // utility window, ...), which were never what that setting is for.
+    // Whether a *non-tiled* window can still get a tab in the strip -
+    // deliberately separate from _isStructurallyEligible/_isTileable (tiling
+    // eligibility, unchanged): kortile is right to never tile a DIALOG/
+    // UTILITY window, but that's no reason to hide it from the tab strip
+    // entirely - a settings dialog or a log/utility window is exactly the
+    // kind of real window a user wants to switch back to. Reuses
+    // FOCUS_BORDER_WINDOW_TYPES (focus-border.js) rather than NORMAL-only:
+    // same "looks like a real window, not chrome/tooltip/menu" allowlist
+    // already vetted there. Fullscreen is deliberately not excluded here
+    // (unlike _isStructurallyEligible) - a fullscreen app is still a real,
+    // switchable window. No ignore-list check here at all: that list's only
+    // remaining job is excluding windows from tiling (_isTileable) - once a
+    // window isn't tiled, for whatever reason, it's eligible for a tab.
+    _isWindowTabEligible(win) {
+        if (!win) return false;
+        if (!FOCUS_BORDER_WINDOW_TYPES.includes(win.get_window_type())) return false;
+        if (win.is_skip_taskbar()) return false;
+        if (win.get_transient_for()) return false;
+        if (win.minimized) return false;
+        if (
+            win.is_on_all_workspaces &&
+            win.is_on_all_workspaces() &&
+            !this._isWorkspaceIndependentMonitor(win.get_monitor())
+        ) {
+            return false;
+        }
         return true;
     }
 
@@ -1215,9 +1347,32 @@ class KortileApplet extends Applet.IconApplet {
         const wsIndex = this._wsIndexForMonitor(monIndex, ws ? ws.index() : global.workspace_manager.get_active_workspace_index());
         const mg = this._getOrCreateManager(wsIndex, monIndex);
 
-        if (!this._originalGeometry.has(win)) {
-            this._originalGeometry.set(win, rectFromMeta(win.get_frame_rect()));
-            this._attachWindowSignals(win);
+        if (!this._windowState.has(win)) {
+            // A window ignore-listed until just now (e.g. the ignore list
+            // changed at runtime) may already be watched by the lightweight
+            // side map below - the full signal set attached here includes
+            // its own notify::minimized connection, so drop that one first
+            // to avoid double-connecting.
+            this._unwatchExtraWindow(win);
+            this._windowState.set(win, {
+                signalIds: this._attachWindowSignals(win),
+                originalGeometry: rectFromMeta(win.get_frame_rect()),
+                lastAppliedRect: null,
+                lastRequestedRect: null,
+                geometryDebounce: null,
+                releasePoll: null,
+                enforceTimer: null,
+                clipGeneration: 0,
+                stubbornCount: null,
+                dragFlag: false,
+                floating: false,
+                nativeMaximized: false,
+                minimizedManager: null,
+                minimizedExtraManager: null,
+                lastExtraManager: null,
+                removedInfo: null,
+                customTabName: null,
+            });
         }
 
         // A window coming back from a *temporary* removal (minimized,
@@ -1228,8 +1383,9 @@ class KortileApplet extends Applet.IconApplet {
         // change while it was away means that remembered slot doesn't mean
         // anything here anymore, so that still falls through to a plain
         // front-insert.
-        const restore = this._removedWindowPosition.get(win);
-        this._removedWindowPosition.delete(win);
+        const state = this._windowState.get(win);
+        const restore = state.removedInfo;
+        state.removedInfo = null;
         if (restore && restore.mg === mg) {
             mg.restoreWindow(win, restore.info);
         } else {
@@ -1260,32 +1416,34 @@ class KortileApplet extends Applet.IconApplet {
         for (const mg of this._managers.values()) {
             if (restore) this._restoreManager(mg);
         }
-        for (const win of Array.from(this._windowSignals.keys())) {
+        // Same ordering requirement as _untrackWindow: these read/cancel
+        // state out of each window's _windowState entry, so they have to
+        // run before the _windowState.clear() below.
+        for (const win of Array.from(this._windowState.keys())) {
             this._detachWindowSignals(win);
         }
-        for (const win of Array.from(this._geometryDebounce.keys())) {
-            this._cancelGeometryDebounce(win);
+        for (const [win, state] of this._windowState) {
+            if (state.geometryDebounce != null) this._cancelGeometryDebounce(win);
         }
-        for (const win of Array.from(this._enforceTimers.keys())) {
-            this._stopEnforcing(win);
+        for (const [win, state] of this._windowState) {
+            if (state.enforceTimer != null) this._stopEnforcing(win);
         }
-        for (const win of Array.from(this._releasePoll.keys())) {
-            this._cancelDragReleasePoll(win);
+        for (const [win, state] of this._windowState) {
+            if (state.releasePoll != null) this._cancelDragReleasePoll(win);
+        }
+        // Ignore-listed windows watched only via the lightweight side map
+        // (see _watchExtraWindowForMinimize) never went through
+        // _detachWindowSignals above - drop their two signals explicitly so
+        // a disable/reload doesn't leave them dangling.
+        for (const win of Array.from(this._extraWindowWatch.keys())) {
+            this._unwatchExtraWindow(win);
         }
         this._managers.clear();
-        this._originalGeometry.clear();
-        this._lastAppliedRect.clear();
-        this._lastRequestedRect.clear();
-        this._stubbornCount.clear();
-        this._dragFlag.clear();
-        this._clipGeneration.clear();
-        this._floatingWindows.clear();
-        this._nativeMaximizedWindows.clear();
-        this._removedWindowPosition.clear();
-        this._minimizedWindowManager.clear();
+        this._windowState.clear();
         this._pendingTrack.clear();
         this._hideFocusBorder();
         this._destroyAllWindowTabStrips();
+        this._destroyAllAutoMinimizedSwitchers();
     }
 
     _attachWindowSignals(win) {
@@ -1325,11 +1483,11 @@ class KortileApplet extends Applet.IconApplet {
             // incidentally refreshed it.
             win.connect("notify::title", () => this._onWindowTitleChanged(win)),
         ];
-        this._windowSignals.set(win, ids);
+        return ids;
     }
 
     _detachWindowSignals(win) {
-        const ids = this._windowSignals.get(win) || [];
+        const ids = this._windowState.get(win)?.signalIds || [];
         for (const id of ids) {
             try {
                 win.disconnect(id);
@@ -1337,7 +1495,6 @@ class KortileApplet extends Applet.IconApplet {
                 // window is already gone
             }
         }
-        this._windowSignals.delete(win);
     }
 
     // ---- tiling ----
@@ -1397,7 +1554,7 @@ class KortileApplet extends Applet.IconApplet {
         // move_frame/move_resize_frame can fire size-changed/position-changed
         // synchronously, mid-call - without this guard, _onWindowGeometryChanged
         // reacting to that echo (comparing against a not-yet-updated
-        // _lastAppliedRect) would call _retile() again from inside this very
+        // lastAppliedRect) would call _retile() again from inside this very
         // call, recursing until Cinnamon aborts with "too much recursion".
         if (this._retiling) return;
         this._retiling = true;
@@ -1407,6 +1564,7 @@ class KortileApplet extends Applet.IconApplet {
             this._retiling = false;
         }
         this._syncWindowTabStrips(mg, tabGroups);
+        this._updateAutoMinimizedSwitcher(mg);
     }
 
     // Mirrors _panelBackgroundIsDark's approach (read the theme's own
@@ -1506,112 +1664,186 @@ class KortileApplet extends Applet.IconApplet {
     // one is switched away from) would otherwise have the strip painted
     // straight over its own content the instant it does.
     //
+    // Windows the tab strip would otherwise never show at all: pulled out
+    // of the grid (floating) or excluded by an ignore rule (ignored) - see
+    // window-tabs-include-floating-ignored. Only ever called when that
+    // setting is on (see _reserveWindowTabSpace) - global.get_window_actors()
+    // over every open window on every workspace/monitor is not something to
+    // pay for on every retile when nobody asked for this.
+    //
+    // Resolved to this manager's own (workspace, monitor) the same way
+    // _trackWindow itself would if either ever got tracked there, so a
+    // floating/ignored window that actually belongs to a *different*
+    // monitor/workspace doesn't leak into this one's strip. Excludes a
+    // minimized one either way - nothing to anchor a strip position against
+    // (no compositor actor), and a minimized *tiled* window already has its
+    // own separate "keep the tab, remember the slot" mechanism (see
+    // minimizedManager) that this isn't meant to duplicate.
+    _collectExtraTabWindows(mg) {
+        const belongsHere = (win) => this._extraTabManagerFor(win) === mg;
+
+        const result = [];
+        const seen = new Set();
+        for (const [win, state] of this._windowState) {
+            if (state.floating && !win.minimized && belongsHere(win)) {
+                result.push(win);
+                seen.add(win);
+                // Kept fresh on every live pass (not just at minimize time)
+                // so _onWindowUnmanaged has a reliable "which strip was this
+                // showing on" to retile without needing to ask the window
+                // itself at close time - confirmed live that
+                // win.get_workspace()/get_monitor() can no longer be
+                // trusted by the time the "unmanaged" signal actually
+                // fires, which made closing a *live* (never-minimized)
+                // floating window leave its tab stuck in the strip forever.
+                state.lastExtraManager = mg;
+            }
+            // A floating window that minimized while showing a tab here
+            // keeps it, same idea as minimizedHere does for genuinely tiled
+            // windows - see _onWindowMinimizedChanged.
+            if (state.minimizedExtraManager === mg && !seen.has(win)) {
+                result.push(win);
+                seen.add(win);
+            }
+        }
+        // A window can only ever be floating if it was tracked at some
+        // point (see _toggleFloating) - already covered by the loop above,
+        // so this only ever adds windows kortile has never tiled at all:
+        // ignore-listed, wrong window type for tiling (DIALOG/UTILITY), or
+        // anything else _isTileable rejects - _isWindowTabEligible doesn't
+        // care which, only !_managerFor(win) (not currently tiled) matters.
+        for (const actor of global.get_window_actors()) {
+            const win = actor.get_meta_window();
+            if (seen.has(win)) continue;
+            if (this._isWindowTabEligible(win) && !this._managerFor(win) && belongsHere(win)) {
+                result.push(win);
+                seen.add(win);
+                // Never _trackWindow'd, so it'd otherwise have no signal
+                // connected at all to notice its own minimize - see
+                // _watchExtraWindowForMinimize.
+                this._watchExtraWindowForMinimize(win);
+                // Same "keep this fresh for _onExtraWindowUnmanaged" reasoning
+                // as state.lastExtraManager just above.
+                const entry = this._extraWindowWatch.get(win);
+                if (entry) entry.lastExtraManager = mg;
+            }
+        }
+        // Same "keep the tab while minimized" idea as the floating case
+        // above, for ignore-listed windows watched via the side map instead
+        // of _windowState (see _watchExtraWindowForMinimize).
+        for (const [win, entry] of this._extraWindowWatch) {
+            if (entry.minimizedExtraManager === mg && !seen.has(win)) {
+                result.push(win);
+                seen.add(win);
+            }
+        }
+        return result;
+    }
+
+    // Connects just enough signal wiring (minimize + close) to an
+    // ignore-listed-but-eligible window to notice it minimizing while it's
+    // showing an extra tab, without pulling it into full tiling tracking
+    // (_attachWindowSignals/_windowState) - see _extraWindowWatch. No-ops
+    // for a window that's already properly tracked (its own signal set
+    // already covers this) or already watched.
+    _watchExtraWindowForMinimize(win) {
+        if (this._windowState.has(win) || this._extraWindowWatch.has(win)) return;
+        const signalIds = [
+            win.connect("notify::minimized", () => this._onExtraWindowMinimizedChanged(win)),
+            win.connect("unmanaged", () => this._onExtraWindowUnmanaged(win)),
+        ];
+        this._extraWindowWatch.set(win, { signalIds, minimizedExtraManager: null, lastExtraManager: null });
+    }
+
+    // Disconnects and forgets a _watchExtraWindowForMinimize entry, if any -
+    // called both from _onExtraWindowUnmanaged and from _trackWindow's
+    // first-time branch (a previously ignore-listed window becoming
+    // genuinely tileable, e.g. the ignore list changed at runtime, is about
+    // to get its own full notify::minimized connection via
+    // _attachWindowSignals - keeping this one around too would double-fire).
+    _unwatchExtraWindow(win) {
+        const entry = this._extraWindowWatch.get(win);
+        if (!entry) return;
+        for (const id of entry.signalIds) win.disconnect(id);
+        this._extraWindowWatch.delete(win);
+    }
+
+    _onExtraWindowMinimizedChanged(win) {
+        const entry = this._extraWindowWatch.get(win);
+        if (!entry) return;
+        if (win.minimized) {
+            entry.minimizedExtraManager = this._extraTabManagerFor(win);
+            if (entry.minimizedExtraManager) this._retile(entry.minimizedExtraManager);
+        } else {
+            const mg = entry.minimizedExtraManager;
+            entry.minimizedExtraManager = null;
+            if (mg) this._retile(mg);
+        }
+    }
+
+    _onExtraWindowUnmanaged(win) {
+        // Same "read the last-remembered manager, don't re-derive it from
+        // the window at teardown time" reasoning as _onWindowUnmanaged's
+        // floating case - win.get_workspace()/get_monitor() are no longer
+        // reliable by the time "unmanaged" fires, see lastExtraManager.
+        const entry = this._extraWindowWatch.get(win);
+        const mg = entry ? entry.minimizedExtraManager || entry.lastExtraManager : null;
+        this._unwatchExtraWindow(win);
+        if (mg) this._retile(mg);
+    }
+
     // Returns the list of groups (each {key, wmClass, windows, rect}, at
     // most one per shared rect) for _syncWindowTabStrips to turn into
     // actual widgets - computing that here, once, rather than a second
     // pass there, since this already has to walk every window in mg to
     // reserve the space.
+    // Every window in the manager - tiled, remembered-minimized-while-tiled,
+    // and any eligible non-tiled extra (window-tabs-include-floating-ignored)
+    // alike - shares exactly one strip, spanning the full bounding box of
+    // every tiled slot, stretched. No per-app/per-slot grouping (removed:
+    // used to also offer a "by application" mode splitting the strip per
+    // slot, with a master-vs-slave distinction for which slot an extra could
+    // join - moot now that master and slaves always share one strip
+    // together, there's no separate per-slot strip for a master to wrongly
+    // gain in the first place). 2 is a fixed minimum (nothing to switch
+    // between with just one) - not configurable. Still only ever a bonus on
+    // top of tiling: with nothing tiled at all (rects empty), there's no
+    // bounding box to anchor to and this returns [] regardless of how many
+    // extras exist - see _openAutoMinimizedSwitcher for that case instead.
+    // Real strip height, scaled from the WINDOW_TAB_STRIP_HEIGHT_DEFAULT
+    // calibration (see its own comment) as windowTabsIconSize/
+    // windowTabsFontSize move away from their own defaults - the taller of
+    // "icon at its configured size" and "label text at its configured size"
+    // drives the strip's real height, same as it does at the default
+    // calibration point.
+    _windowTabStripHeight() {
+        const iconPart = this.windowTabsIconSize || WINDOW_TAB_ICON_SIZE_DEFAULT;
+        const fontPart = (this.windowTabsFontSize || WINDOW_TAB_FONT_SIZE_DEFAULT) * WINDOW_TAB_ICON_SIZE_DEFAULT;
+        const defaultContent = Math.max(WINDOW_TAB_ICON_SIZE_DEFAULT, WINDOW_TAB_FONT_SIZE_DEFAULT * WINDOW_TAB_ICON_SIZE_DEFAULT);
+        const chrome = WINDOW_TAB_STRIP_HEIGHT_DEFAULT - defaultContent;
+        return Math.round(Math.max(iconPart, fontPart) + chrome);
+    }
+
     _reserveWindowTabSpace(mg, rects) {
         if (!this.windowTabsEnabled) return [];
 
         // A minimized window is removed from its manager entirely the
         // moment it minimizes (see _onWindowMinimizedChanged) - it has no
         // rect of its own here to share, only remembered so it can still
-        // join whichever group its app's other windows already occupy,
-        // rather than disappearing from the strip while minimized with no
-        // way back into it short of the taskbar/window list.
+        // join the strip, rather than disappearing from it while minimized
+        // with no way back into it short of the taskbar/window list.
         const minimizedHere = [];
-        for (const [win, ownerMg] of this._minimizedWindowManager) {
-            if (ownerMg === mg) minimizedHere.push(win);
+        for (const [win, state] of this._windowState) {
+            if (state.minimizedManager === mg) minimizedHere.push(win);
         }
 
-        // windowTabsMinWindows (schema min: 2 - a strip needs at least two
-        // windows sharing a slot to have anything to switch between at
-        // all).
-        const minWindows = this.windowTabsMinWindows || 2;
-
-        if (this.windowTabsGrouping === "all") return this._reserveSharedWindowTabSpace(mg, rects, minimizedHere, minWindows);
-
-        const byRectKey = new Map();
-        for (const [win, rect] of rects) {
-            const rectKey = `${rect.x},${rect.y},${rect.w},${rect.h}`;
-            if (!byRectKey.has(rectKey)) byRectKey.set(rectKey, []);
-            byRectKey.get(rectKey).push(win);
-        }
-
-        // "By application" only tabs together windows of the *same* app
-        // sharing a slot - two different apps forced to share one (a
-        // "maximized" layout shares its single slot between everything,
-        // or slavesMax rounding several apps onto one slot) stay
-        // switchable only via Alt+Tab/the taskbar (or the "All open
-        // windows" mode above).
-        const groups = [];
-        for (const [rectKey, wins] of byRectKey) {
-            const topmost = global.display.sort_windows_by_stacking(wins).pop();
-            const cls = topmost.get_wm_class() || "";
-            const sameAppVisible = wins.filter((w) => (w.get_wm_class() || "") === cls);
-            const sameAppMinimized = minimizedHere.filter((w) => (w.get_wm_class() || "") === cls);
-            const sameApp = sameAppVisible.concat(sameAppMinimized);
-            if (sameApp.length < minWindows) continue;
-
-            const baseRect = rects.get(wins[0]);
-            const baseX = baseRect.x,
-                baseY = baseRect.y,
-                baseW = baseRect.w,
-                baseH = baseRect.h;
-            const atBottom = this.windowTabsSide === "bottom";
-
-            // Several windows sharing a slot share the exact same rect
-            // *object* (Manager.compute() assigns one slot object to all of
-            // them, see the s.forEach round-robin there) - adjust each
-            // distinct rect object exactly once, tracked by identity, so
-            // sharing it doesn't compound the same adjustment several times
-            // over as this loop revisits it once per window.
-            const adjusted = new Set();
-            for (const w of wins) {
-                const r = rects.get(w);
-                if (adjusted.has(r)) continue;
-                adjusted.add(r);
-                if (!atBottom) r.y += WINDOW_TAB_STRIP_HEIGHT;
-                r.h = Math.max(1, r.h - WINDOW_TAB_STRIP_HEIGHT);
-            }
-
-            const key = `${mg.workspaceIndex}:${mg.monitorIndex}:${rectKey}`;
-            groups.push({
-                key,
-                wmClass: cls,
-                windows: this._orderWindowTabGroup(key, sameApp),
-                rect: { x: baseX, y: atBottom ? baseY + baseH - WINDOW_TAB_STRIP_HEIGHT : baseY, w: baseW, h: WINDOW_TAB_STRIP_HEIGHT },
-            });
-        }
-        return groups;
-    }
-
-    // "All open windows" tab grouping: one strip for the *whole monitor*,
-    // listing every window this manager tracks - master and every slave
-    // alike - regardless of which of the layout's several distinct rects
-    // each one actually sits in. The layout itself is untouched (ratios,
-    // mastersMax/slavesMax, master/slave split all stay exactly as
-    // computed) - only the rects that actually sit against the strip's own
-    // edge of the monitor's bounding box (the top row when the strip is on
-    // top, the bottom row when it's on the bottom) lose a
-    // WINDOW_TAB_STRIP_HEIGHT sliver there to make room for it. Every rect
-    // further down a stack (a second, third, ... slave stacked below the
-    // first) isn't actually under the strip at all and is left completely
-    // untouched. Confirmed live this distinction matters the moment a
-    // slave stack has more than one row: shrinking *every* window's own
-    // top unconditionally (the "maximized" layout's one-shared-rect case
-    // this used to lean on - there, every window's rect *is* the same
-    // object, so the distinction never came up) pushed each stacked slave
-    // down by a full strip height without shrinking the rect above it to
-    // compensate, opening a WINDOW_TAB_STRIP_HEIGHT gap - on top of the
-    // ordinary configured gap - above every slave but the first.
-    _reserveSharedWindowTabSpace(mg, rects, minimizedHere, minWindows) {
+        const extra = this.windowTabsIncludeFloatingIgnored ? this._collectExtraTabWindows(mg) : [];
         const all = mg.allWindows();
-        const combined = all.concat(minimizedHere);
-        if (combined.length < minWindows) return [];
+        const combined = all.concat(minimizedHere).concat(extra);
+        if (combined.length < 2) return [];
 
         const atBottom = this.windowTabsSide === "bottom";
+        const stripHeight = this._windowTabStripHeight();
         let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
         for (const w of all) {
             const r = rects.get(w);
@@ -1630,11 +1862,11 @@ class KortileApplet extends Applet.IconApplet {
             adjusted.add(r);
             if (atBottom) {
                 if (r.y + r.h !== maxY) continue;
-                r.h = Math.max(1, r.h - WINDOW_TAB_STRIP_HEIGHT);
+                r.h = Math.max(1, r.h - stripHeight);
             } else {
                 if (r.y !== minY) continue;
-                r.y += WINDOW_TAB_STRIP_HEIGHT;
-                r.h = Math.max(1, r.h - WINDOW_TAB_STRIP_HEIGHT);
+                r.y += stripHeight;
+                r.h = Math.max(1, r.h - stripHeight);
             }
         }
 
@@ -1644,11 +1876,29 @@ class KortileApplet extends Applet.IconApplet {
                 key,
                 wmClass: "",
                 windows: this._orderWindowTabGroup(key, combined),
-                rect: { x: minX, y: atBottom ? maxY - WINDOW_TAB_STRIP_HEIGHT : minY, w: maxX - minX, h: WINDOW_TAB_STRIP_HEIGHT },
+                rect: { x: minX, y: atBottom ? maxY - stripHeight : minY, w: maxX - minX, h: stripHeight },
             },
         ];
     }
 
+    // One strip for the *whole monitor*, listing every window this manager
+    // tracks - master and every slave alike - regardless of which of the
+    // layout's several distinct rects each one actually sits in. The layout
+    // itself is untouched (ratios, mastersMax/slavesMax, master/slave split
+    // all stay exactly as computed) - only the rects that actually sit
+    // against the strip's own edge of the monitor's bounding box (the top
+    // row when the strip is on top, the bottom row when it's on the bottom)
+    // lose a _windowTabStripHeight() sliver there to make room for it.
+    // Every rect further down a stack (a second, third, ... slave stacked
+    // below the first) isn't actually under the strip at all and is left
+    // completely untouched. Confirmed live this distinction matters the
+    // moment a slave stack has more than one row: shrinking *every*
+    // window's own top unconditionally (the "maximized" layout's
+    // one-shared-rect case this used to lean on - there, every window's
+    // rect *is* the same object, so the distinction never came up) pushed
+    // each stacked slave down by a full strip height without shrinking the
+    // rect above it to compensate, opening a strip-height gap - on top of
+    // the ordinary configured gap - above every slave but the first.
     // A user drag-reorder (see _commitWindowTabDragOrder) is remembered per
     // group key and re-applied here on every rebuild, persisted to disk
     // (see _saveWindowTabOrder) the same way a remembered layout is -
@@ -1773,7 +2023,7 @@ class KortileApplet extends Applet.IconApplet {
                 this._windowTabGroups.set(g.key, entry);
             }
             // y is independent of the button set below; x depends on the
-            // strip's natural width (windowTabsPosition), so it's set only
+            // slot's rect (always spans its full width), so it's set only
             // after that's settled, below. Kept on the entry too (not just
             // used locally here) so _onWindowTitleChanged's own lighter-
             // weight refresh can recompute x for a width change without
@@ -1851,9 +2101,8 @@ class KortileApplet extends Applet.IconApplet {
     // addToWindowgroup in _syncWindowTabStrips) instead of always-on-top
     // chrome: placed directly above whichever of its own group's windows is
     // currently topmost (usually whichever tab _activateAndRaise last
-    // raised), the same "topmost of the group" _reserveWindowTabSpace
-    // itself already uses to decide which app's tabs to show. Anything
-    // genuinely raised above that - a floating window the user drags there,
+    // raised). Anything genuinely raised above that - a floating window the
+    // user drags there,
     // or any other window kortile never tracked at all - then paints over
     // the strip exactly like it would over any other window sharing that
     // z-order, with no geometry-overlap bookkeeping needed to hide the
@@ -1862,24 +2111,59 @@ class KortileApplet extends Applet.IconApplet {
     // anchor against (every member currently minimized, say) - there's
     // nothing real tiled there right now for it to hide behind anyway.
     _restackWindowTabStrip(entry) {
-        const topmost = this._topmostGroupWindow(entry);
+        // onlyTiled: a genuinely tiled member's rect is guaranteed to have
+        // had _windowTabStripHeight() carved out of its top for the strip
+        // (see _reserveWindowTabSpace) -
+        // a floating/ignored extra's never is, kortile deliberately never
+        // touches its geometry at all. Anchoring above *that* one instead
+        // (confirmed live: an extra sitting at/near the slot's own position,
+        // its own title bar included) painted the strip straight over the
+        // top of its title bar rather than in the reserved gap above it.
+        // Anchoring to the topmost *tiled* member instead still keeps the
+        // strip above every tiled window (each has real room for it) while
+        // an extra raised above that tiled window in real stacking order -
+        // any focused/active one - stays above the strip too, the same as
+        // any other window genuinely raised above the whole group already
+        // does per this method's own doc comment.
+        const topmost = this._topmostGroupWindow(entry, true);
         if (!topmost) {
             global.window_group.set_child_above_sibling(entry.actor, null);
+            return;
+        }
+        // A tiled window mid-drag (dragFlag, see _onWindowGeometryChanged/
+        // _commitGeometryChange) is wherever the user's currently dragging
+        // it, not sitting in the slot its own rect claims - the same "no
+        // real reserved space to hide behind" situation an extra has, just
+        // temporary. Confirmed live: dragging a tiled window over the strip
+        // left the strip painted on top of it instead of the window
+        // covering the strip like everything else raised above the group
+        // already does - below instead of above for exactly this one.
+        if (this._windowState.get(topmost)?.dragFlag) {
+            global.window_group.set_child_below_sibling(entry.actor, topmost.get_compositor_private());
             return;
         }
         global.window_group.set_child_above_sibling(entry.actor, topmost.get_compositor_private());
     }
 
-    // Shared by _restackWindowTabStrip (z-order) and _windowTabStripRect
-    // (layout) - whichever of a group's own windows is currently topmost in
-    // real stacking order, the same one _reserveWindowTabSpace itself
-    // already uses to decide which app's tabs to show. null when nothing in
-    // the group has a live compositor actor to anchor against (every member
-    // currently minimized, say).
-    _topmostGroupWindow(entry) {
+    // Used by _restackWindowTabStrip (z-order) - whichever of a group's own
+    // windows is currently topmost in real stacking order. null when
+    // nothing in the group has a live compositor actor to anchor against
+    // (every member currently minimized, say).
+    //
+    // onlyTiled restricts the candidates to windows this manager actually
+    // tiles - a floating/ignored extra's own live frame can be anywhere on
+    // screen, any size, entirely unrelated to the strip's own slot, so
+    // _restackWindowTabStrip always passes this to avoid anchoring the
+    // strip's z-order to one of those instead of a real tiled window. A
+    // group only ever gains a floating/ignored member by joining an
+    // *existing* group built around at least one real tiled window (see
+    // _reserveWindowTabSpace), so onlyTiled never empties out a group that
+    // had any candidates at all without it.
+    _topmostGroupWindow(entry, onlyTiled = false) {
         const candidates = [];
         for (const win of entry.buttons.keys()) {
             if (win.minimized) continue;
+            if (onlyTiled && !this._managerFor(win)) continue;
             if (win.get_compositor_private()) candidates.push(win);
         }
         if (candidates.length === 0) return null;
@@ -1890,10 +2174,10 @@ class KortileApplet extends Applet.IconApplet {
     // _startWindowTabRename) overrides the window's own title everywhere a
     // tab shows text for it - label and tooltip alike - until cleared
     // (empty rename) or the window closes; it's kept in memory only
-    // (_windowTabCustomNames), same as every other per-window Map here, so
-    // it never survives past that window's own lifetime.
+    // (_windowState's customTabName field), so it never survives past that
+    // window's own lifetime.
     _windowTabDisplayTitle(win) {
-        return this._windowTabCustomNames.get(win) || win.get_title() || "";
+        return this._windowState.get(win)?.customTabName || win.get_title() || "";
     }
 
     _windowTabTitle(win) {
@@ -1902,17 +2186,18 @@ class KortileApplet extends Applet.IconApplet {
     }
 
     _createWindowTabButton(win, groupKey) {
+        const iconSize = this.windowTabsIconSize || WINDOW_TAB_ICON_SIZE_DEFAULT;
         const app = Cinnamon.WindowTracker.get_default().get_window_app(win);
         const icon = app
-            ? app.create_icon_texture(WINDOW_TAB_ICON_SIZE)
-            : new St.Icon({ icon_name: "application-x-executable", icon_size: WINDOW_TAB_ICON_SIZE });
+            ? app.create_icon_texture(iconSize)
+            : new St.Icon({ icon_name: "application-x-executable", icon_size: iconSize });
 
         let child = icon;
         let label = null;
         let box = null;
         if (this.windowTabsStyle === "icons-titles") {
             label = new St.Label({ text: this._windowTabTitle(win) });
-            label.style = `font-size: 0.9em; color: ${this._windowTabForegroundHex()};`;
+            label.style = `font-size: ${this.windowTabsFontSize || WINDOW_TAB_FONT_SIZE_DEFAULT}em; color: ${this._windowTabForegroundHex()};`;
             box = new St.BoxLayout();
             box.style = "spacing: 5px;";
             box.add_actor(icon);
@@ -1937,7 +2222,7 @@ class KortileApplet extends Applet.IconApplet {
         // (Clutter.ActorAlign: FILL/START/CENTER/END = 0/1/2/3) - confirmed
         // live that Clutter.ActorAlign.CENTER here silently lands as raw
         // integer 2, which St.Align reads back as END, not MIDDLE.
-        btn.x_expand = !!this.windowTabsStretch;
+        btn.x_expand = true;
         btn.x_fill = false;
         btn.x_align = St.Align.MIDDLE;
         btn._kortileWin = win;
@@ -2286,8 +2571,8 @@ class KortileApplet extends Applet.IconApplet {
         if (!btn._kortileEditing) return;
         btn._kortileEditing = false;
         const text = btn._kortileEntry.get_text().trim();
-        if (text) this._windowTabCustomNames.set(win, text);
-        else this._windowTabCustomNames.delete(win);
+        const state = this._windowState.get(win);
+        if (state) state.customTabName = text || null;
         this._endWindowTabRename(btn, win);
     }
 
@@ -2327,10 +2612,6 @@ class KortileApplet extends Applet.IconApplet {
     _refreshWindowTabButton(btn, win) {
         if (btn._kortileTooltip) btn._kortileTooltip.set_text(this._windowTabDisplayTitle(win));
         if (btn._kortileLabel) btn._kortileLabel.set_text(this._windowTabTitle(win));
-        // Keeps an existing (reused, not recreated) button in sync if
-        // windowTabsStretch was toggled since it was created - see
-        // _createWindowTabButton.
-        btn.x_expand = !!this.windowTabsStretch;
     }
 
     // win's own title just changed (see the notify::title connection in
@@ -2357,29 +2638,22 @@ class KortileApplet extends Applet.IconApplet {
         }
     }
 
-    // windowTabsStretch off (default): the strip is only as wide as its
-    // tabs need, positioned per windowTabsPosition. On: it always spans
-    // the slot's full width instead - set_width(-1) first clears any
-    // fixed width a *previous* sync left behind (Clutter's own convention
-    // for "go back to natural sizing"), needed for toggling the setting
-    // back off to actually shrink the strip again rather than leaving it
-    // stuck at whatever width stretch mode last forced. Uses
-    // _windowTabStripRect (the group's real, currently-topmost window
-    // width) rather than entry.rect (the slot kortile originally asked for)
-    // - see there for why those two can differ.
+    // The strip always spans entry.rect's full width (the bounding box of
+    // every tiled slot, see _reserveWindowTabSpace) - tabs spread out evenly
+    // to fill it. Deliberately *not* narrowed to whichever single member
+    // window is currently topmost/focused (an earlier version did this, to
+    // paper over a VTE terminal's own resize-rounding leaving its real
+    // frame_rect a few px narrower than its slot) - confirmed live that
+    // falls apart the moment master and slaves have different-width slots
+    // of their own: the strip's width/x would jump between them every time
+    // focus (and so "topmost") moved from one to the other, in a layout
+    // that's supposed to show exactly one stable, full-width strip
+    // regardless of which window currently has focus.
     _layoutWindowTabStrip(entry) {
         if (!entry.rect) return;
-        const rect = this._windowTabStripRect(entry);
-        if (this.windowTabsStretch) {
-            entry.actor.set_width(rect.w);
-            entry.actor.set_x(rect.x);
-            this._equalizeWindowTabWidths(entry, rect);
-        } else {
-            entry.actor.set_width(-1);
-            for (const btn of entry.buttons.values()) btn.set_width(-1);
-            const [, naturalWidth] = entry.actor.get_preferred_width(-1);
-            entry.actor.set_x(computeWindowTabStripX(rect.x, rect.w, naturalWidth, this.windowTabsPosition));
-        }
+        entry.actor.set_width(entry.rect.w);
+        entry.actor.set_x(entry.rect.x);
+        this._equalizeWindowTabWidths(entry, entry.rect);
     }
 
     // A VTE-based terminal (gnome-terminal among them) rounds a requested
@@ -2394,14 +2668,10 @@ class KortileApplet extends Applet.IconApplet {
     // the strip to that same real rect instead keeps both of them agreeing
     // with each other and with the window itself. Falls back to the slot's
     // own rect (entry.rect) when there's no live window to measure - same
-    // case _topmostGroupWindow itself already returns null for.
-    _windowTabStripRect(entry) {
-        const topmost = this._topmostGroupWindow(entry);
-        if (!topmost) return entry.rect;
-        const r = topmost.get_frame_rect();
-        return { x: r.x, y: entry.rect.y, w: r.width, h: entry.rect.h };
-    }
-
+    // case _topmostGroupWindow itself already returns null for. onlyTiled
+    // (see _topmostGroupWindow) keeps a floating/ignored group member (see
+    // window-tabs-include-floating-ignored) from being measured here - its
+    // own live frame has nothing to do with this slot.
     // Stretch mode used to just give every tab an equal *share of leftover*
     // space on top of its own natural width (Clutter's own x_expand
     // distribution, x_fill left off) - confirmed live that still left tabs
@@ -2542,7 +2812,7 @@ class KortileApplet extends Applet.IconApplet {
         // rect underneath hasn't itself changed.
         //
         // "Already sitting where it's being asked to" is judged against
-        // _lastAppliedRect (what Mutter actually settled the frame at last
+        // lastAppliedRect (what Mutter actually settled the frame at last
         // time, read back post-move below), not the bare request - an app
         // whose own size hints won't let it land on an arbitrary pixel size
         // (gnome-terminal is the reported case: WM_SIZE_HINTS resize
@@ -2553,17 +2823,18 @@ class KortileApplet extends Applet.IconApplet {
         // every single retile even though nothing meaningful changed, which
         // for such an app is visible as its own height wobbling on every
         // focus change even while the computed tile target never moved.
-        // _lastRequestedRect (the bare ask, tracked separately from what
+        // lastRequestedRect (the bare ask, tracked separately from what
         // actually landed) is what still catches a *genuinely* new target -
         // only the reality check below is against what really landed, not
         // what was asked for. This doesn't close the underlying few-px gap
         // itself (that's the app's own size hints, outside this applet's
         // control), just the repeated re-application of it.
-        const lastRequested = this._lastRequestedRect.get(win);
+        const state = this._windowState.get(win);
+        const lastRequested = state ? state.lastRequestedRect : null;
         const requestUnchanged =
             lastRequested && lastRequested.x === x && lastRequested.y === y && lastRequested.w === w && lastRequested.h === h;
-        this._lastRequestedRect.set(win, { x, y, w, h });
-        const last = this._lastAppliedRect.get(win);
+        if (state) state.lastRequestedRect = { x, y, w, h };
+        const last = state ? state.lastAppliedRect : null;
         if (win.get_maximized() === 0 && requestUnchanged && last) {
             const cur = win.get_frame_rect();
             if (cur.x === last.x && cur.y === last.y && cur.width === last.w && cur.height === last.h) return;
@@ -2648,8 +2919,8 @@ class KortileApplet extends Applet.IconApplet {
             // a bigger stale nudge slip through the same way.
             const staleX = beforeFrame.x !== x ? beforeX : null;
             const staleY = beforeFrame.y !== y ? beforeY : null;
-            const generation = (this._clipGeneration.get(win) || 0) + 1;
-            this._clipGeneration.set(win, generation);
+            const generation = (state ? state.clipGeneration : 0) + 1;
+            if (state) state.clipGeneration = generation;
             this._applyClipWhenSettled(win, w, h, 0, generation, staleX, staleY);
         }
 
@@ -2682,7 +2953,7 @@ class KortileApplet extends Applet.IconApplet {
         }
 
         const applied = win.get_frame_rect();
-        this._lastAppliedRect.set(win, { x: applied.x, y: applied.y, w: applied.width, h: applied.height });
+        if (state) state.lastAppliedRect = { x: applied.x, y: applied.y, w: applied.width, h: applied.height };
     }
 
     // See _applyOne - polls (25ms, up to 2s) until frame.x - actor.x /
@@ -2746,8 +3017,22 @@ class KortileApplet extends Applet.IconApplet {
     // row (25ms apart) before trusting it - actually settled, not just
     // "moved away from where it started" - which staleX/staleY alone can't
     // tell apart from "still mid-transition".
-    _applyClipWhenSettled(win, w, h, attempt, generation, staleX = null, staleY = null, lastSeen = null) {
-        if (this._clipGeneration.get(win) !== generation) return;
+    //
+    // Still not the whole gap: confirmed live, a Chromium window opened
+    // directly on a non-primary monitor briefly showed a black band plus a
+    // leftover fragment of stale content right at the edge of its own
+    // clip - geometry (a.x/a.y/a.width/a.height) had already reported the
+    // final settled size for a full tick by the time the clip committed,
+    // but the actor's actual painted *content* hadn't caught up to that
+    // size yet (a GPU-side texture reallocation when a window's compositing
+    // moves to a different output isn't necessarily done by the same frame
+    // its reported geometry updates). Geometry alone can't distinguish
+    // "resized" from "resized AND repainted" - REQUIRED_STABLE_TICKS
+    // consecutive matching samples (not just one) is the cheapest available
+    // proxy for the latter: still just tens of ms of extra wait, imperceptible,
+    // but enough slack in practice for the repaint to land first.
+    _applyClipWhenSettled(win, w, h, attempt, generation, staleX = null, staleY = null, lastSeen = null, stableStreak = 0) {
+        if (this._windowState.get(win)?.clipGeneration !== generation) return;
         const a = win.get_compositor_private();
         if (!a) return;
         const stillStale = (staleX !== null && a.x === staleX) || (staleY !== null && a.y === staleY);
@@ -2761,8 +3046,9 @@ class KortileApplet extends Applet.IconApplet {
             a.width <= w + SHADOW_MARGIN_MAX * 2 &&
             a.height >= h &&
             a.height <= h + SHADOW_MARGIN_MAX * 2;
-        const stable = !!lastSeen && lastSeen.x === a.x && lastSeen.y === a.y && lastSeen.width === a.width && lastSeen.height === a.height;
-        if (!stillStale && stable && offsetSane && sizeSane) {
+        const matchesLast = !!lastSeen && lastSeen.x === a.x && lastSeen.y === a.y && lastSeen.width === a.width && lastSeen.height === a.height;
+        const streak = matchesLast ? stableStreak + 1 : 0;
+        if (!stillStale && streak >= REQUIRED_STABLE_TICKS && offsetSane && sizeSane) {
             a.set_clip(offX, offY, w, h);
             return;
         }
@@ -2784,7 +3070,7 @@ class KortileApplet extends Applet.IconApplet {
         }
         const seen = { x: a.x, y: a.y, width: a.width, height: a.height };
         GLib.timeout_add(GLib.PRIORITY_DEFAULT, 25, () => {
-            this._applyClipWhenSettled(win, w, h, attempt + 1, generation, staleX, staleY, seen);
+            this._applyClipWhenSettled(win, w, h, attempt + 1, generation, staleX, staleY, seen, streak);
             return GLib.SOURCE_REMOVE;
         });
     }
@@ -2809,16 +3095,18 @@ class KortileApplet extends Applet.IconApplet {
     // still for a few consecutive ticks, and _commitGeometryChange restarts
     // it if the window drifts again later.
     _startEnforcing(win) {
-        if (this._enforceTimers.has(win)) return;
+        if (this._windowState.get(win)?.enforceTimer != null) return;
         let settledTicks = 0;
         const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
             if (!this.tilingEnabled) {
-                this._enforceTimers.delete(win);
+                const s = this._windowState.get(win);
+                if (s) s.enforceTimer = null;
                 return GLib.SOURCE_REMOVE;
             }
             const mg = this._managerFor(win);
             if (!mg) {
-                this._enforceTimers.delete(win);
+                const s = this._windowState.get(win);
+                if (s) s.enforceTimer = null;
                 return GLib.SOURCE_REMOVE;
             }
 
@@ -2842,7 +3130,8 @@ class KortileApplet extends Applet.IconApplet {
             if (onTarget) {
                 settledTicks++;
                 if (settledTicks >= 3) {
-                    this._enforceTimers.delete(win);
+                    const s = this._windowState.get(win);
+                    if (s) s.enforceTimer = null;
                     return GLib.SOURCE_REMOVE;
                 }
                 return GLib.SOURCE_CONTINUE;
@@ -2852,14 +3141,16 @@ class KortileApplet extends Applet.IconApplet {
             this._applyOne(win, target, false);
             return GLib.SOURCE_CONTINUE;
         });
-        this._enforceTimers.set(win, id);
+        const state = this._windowState.get(win);
+        if (state) state.enforceTimer = id;
     }
 
     _stopEnforcing(win) {
-        const id = this._enforceTimers.get(win);
-        if (id) {
+        const state = this._windowState.get(win);
+        const id = state ? state.enforceTimer : null;
+        if (id != null) {
             GLib.source_remove(id);
-            this._enforceTimers.delete(win);
+            state.enforceTimer = null;
         }
     }
 
@@ -2901,7 +3192,8 @@ class KortileApplet extends Applet.IconApplet {
     // so that's the way back in if a restored window is wanted back.
     _restoreManager(mg) {
         for (const win of Array.from(mg.allWindows())) {
-            const orig = this._originalGeometry.get(win);
+            const state = this._windowState.get(win);
+            const orig = state ? state.originalGeometry : null;
             this._untrackWindow(win, mg);
             if (orig) win.move_resize_frame(true, orig.x, orig.y, orig.w, orig.h);
         }
@@ -3168,123 +3460,20 @@ class KortileApplet extends Applet.IconApplet {
         this._updateFocusBorder();
     }
 
+    // These four are thin delegates to this._focusBorder (a FocusBorder
+    // instance, see focus-border.js) kept as methods here, under their
+    // original names, purely so the ~20 call sites throughout this file
+    // that trigger a border update/hide don't all need touching just
+    // because the implementation moved to its own file.
     _applyFocusBorderStyle() {
-        const color = this.focusBorderColor || FOCUS_BORDER_COLOR_DEFAULT;
-        const width = Math.max(1, this.focusBorderWidth || FOCUS_BORDER_WIDTH_DEFAULT);
-        this._focusBorder.style = `border: ${width}px solid ${color}; border-radius: 2px;`;
+        this._focusBorder.applyStyle();
     }
 
     _updateFocusBorder() {
-        // Tiling off (menu/keybinding/Settings) already untracks every
-        // window and hides the border once, via _untrackAll -
-        // _hideFocusBorder() - but nothing here stopped it coming right
-        // back: this function has no idea tiling is off, so the very next
-        // focus change (clicking any window at all) ran straight through
-        // to showing it again, on a window kortile isn't even touching
-        // anymore. The border's own purpose (telling tiled windows apart,
-        // several of which have no WM-drawn border of their own) doesn't
-        // apply to anything once tiling itself is off.
-        if (!this.tilingEnabled || !this.focusBorderEnabled) {
-            this._hideFocusBorder();
-            return;
-        }
-
-        const win = global.display.focus_window;
-        // A fullscreen window's frame *is* the screen, so a border around
-        // it would just outline the screen edge - never useful.
-        if (!win || win.minimized || win.is_fullscreen()) {
-            this._hideFocusBorder();
-            return;
-        }
-        if (!FOCUS_BORDER_WINDOW_TYPES.includes(win.get_window_type())) {
-            this._hideFocusBorder();
-            return;
-        }
-        // A brand-new window, not tracked yet (see _onWindowCreated) -
-        // showing the border now and possibly hiding it again a moment
-        // later once tracking resolves is a real, visible flash, not just
-        // a stale-until-corrected state. Wait for that to resolve either
-        // way instead of guessing.
-        if (this._pendingTrack.has(win)) {
-            global.log(`[kortile-debug] _updateFocusBorder: still pending, hiding border for "${win.get_wm_class() || "?"}"`);
-            this._hideFocusBorder();
-            return;
-        }
-
-        const activeWs = global.workspace_manager.get_active_workspace_index();
-        const onActiveWorkspace = win.get_workspace() && win.get_workspace().index() === activeWs;
-        if (!onActiveWorkspace) {
-            this._hideFocusBorder();
-            return;
-        }
-
-        // Same idea as fullscreen: in maximized layout every window fills
-        // the whole work area, so its border is likewise just a screen-edge
-        // outline - true of any window there, master or slave (that split
-        // is arbitrary in maximized layout, just whichever order windows
-        // were opened in, and carries no visual meaning), so this is
-        // optionally skipped for all of them, not just the master.
-        const mg = this._managerFor(win);
-        if (mg && mg.layout === "maximized" && this.focusBorderHideMaximized) {
-            this._hideFocusBorder();
-            return;
-        }
-
-        if (win !== this._focusBorderWin) {
-            this._disconnectFocusBorderWindow();
-            this._focusBorderWin = win;
-            // Keep the outline glued to this window between focus changes -
-            // it can move/resize (drag, retile, workspace follow) without
-            // ever losing and regaining focus in between.
-            this._focusBorderSignalIds = [
-                win.connect("position-changed", () => this._updateFocusBorder()),
-                win.connect("size-changed", () => this._updateFocusBorder()),
-                win.connect("unmanaged", () => this._hideFocusBorder()),
-            ];
-        }
-
-        const r = win.get_frame_rect();
-        const bw = Math.max(1, this.focusBorderWidth || FOCUS_BORDER_WIDTH_DEFAULT);
-        // A tab strip reserves its own space directly above (or, with
-        // windowTabsSide "bottom", below) any window sharing that slot
-        // (see _reserveWindowTabSpace) - the usual bw-px outward outset on
-        // every side assumes an actual empty tile gap there to grow into,
-        // which doesn't exist on whichever side the strip occupies:
-        // confirmed live the border's own edge extended straight into the
-        // strip's reserved area instead, visibly overlapping it (worse the
-        // wider the configured border width). Skip the outset specifically
-        // on that one side for a window currently covered by a strip -
-        // the other three still border a normal tile gap, unaffected.
-        let topExtend = bw;
-        let bottomExtend = bw;
-        for (const entry of this._windowTabGroups.values()) {
-            if (entry.buttons.has(win)) {
-                if (this.windowTabsSide === "bottom") bottomExtend = 0;
-                else topExtend = 0;
-                break;
-            }
-        }
-        this._focusBorder.set_position(r.x - bw, r.y - topExtend);
-        this._focusBorder.set_size(r.width + 2 * bw, r.height + topExtend + bottomExtend);
-        this._focusBorder.show();
-    }
-
-    _disconnectFocusBorderWindow() {
-        if (this._focusBorderWin) {
-            for (const id of this._focusBorderSignalIds) {
-                try {
-                    this._focusBorderWin.disconnect(id);
-                } catch (e) {
-                    // window is already gone
-                }
-            }
-        }
-        this._focusBorderSignalIds = [];
-        this._focusBorderWin = null;
+        this._focusBorder.update();
     }
 
     _hideFocusBorder() {
-        this._disconnectFocusBorderWindow();
         this._focusBorder.hide();
     }
 
@@ -3370,7 +3559,7 @@ class KortileApplet extends Applet.IconApplet {
             // the border stuck showing with nothing left to correct it.
             this._updateFocusBorder();
             global.log(
-                `[kortile-debug] track() done for "${_dbgName}" +${(GLib.get_monotonic_time() - _dbgT0) / 1000}ms borderVisible=${this._focusBorder.visible}`
+                `[kortile-debug] track() done for "${_dbgName}" +${(GLib.get_monotonic_time() - _dbgT0) / 1000}ms borderVisible=${this._focusBorder.actor.visible}`
             );
         };
         const actor = metaWindow.get_compositor_private();
@@ -3394,34 +3583,38 @@ class KortileApplet extends Applet.IconApplet {
         const mg = this._managerFor(win);
         // A minimized window has already been removed from its manager
         // (_managerFor(win) above is null for it) but can still be
-        // showing a tab for it, kept alive by _minimizedWindowManager
+        // showing a tab for it, kept alive by _windowState's minimizedManager field
         // (see _onWindowMinimizedChanged/_reserveWindowTabSpace) - closing
         // it from there (its taskbar entry, say, never un-minimizing it
         // first) needs that same manager retiled too, or its now-dead tab
         // would linger in the strip until something unrelated happened to
         // retile that manager next.
-        const minimizedMg = this._minimizedWindowManager.get(win);
+        const state = this._windowState.get(win);
+        const minimizedMg = state ? state.minimizedManager : null;
+        // A floating window closed while showing an extra tab (window-tabs-
+        // include-floating-ignored) - whether currently minimized or just
+        // live - needs that group retiled too, same reasoning as minimizedMg
+        // just above. Reads state.lastExtraManager rather than re-deriving
+        // via _extraTabManagerFor(win) here: confirmed live that
+        // win.get_workspace()/get_monitor() are no longer reliable by the
+        // time the "unmanaged" signal fires, which silently produced a
+        // wrong (or no) manager and left the tab stuck in the strip - see
+        // lastExtraManager's own comment above.
+        const extraMg = state ? state.minimizedExtraManager || state.lastExtraManager : null;
         this._detachWindowSignals(win);
-        this._originalGeometry.delete(win);
-        this._lastAppliedRect.delete(win);
-        this._lastRequestedRect.delete(win);
-        this._stubbornCount.delete(win);
-        this._dragFlag.delete(win);
-        this._clipGeneration.delete(win);
-        this._floatingWindows.delete(win);
-        this._nativeMaximizedWindows.delete(win);
-        this._removedWindowPosition.delete(win);
-        this._windowTabCustomNames.delete(win);
-        this._minimizedWindowManager.delete(win);
-        this._pendingTrack.delete(win);
+        // Same ordering requirement as _untrackWindow - cancel before delete.
         this._cancelGeometryDebounce(win);
         this._stopEnforcing(win);
         this._cancelDragReleasePoll(win);
+        this._windowState.delete(win);
+        this._pendingTrack.delete(win);
         if (mg) {
             mg.removeWindow(win);
             this._retile(mg);
         } else if (minimizedMg) {
             this._retile(minimizedMg);
+        } else if (extraMg) {
+            this._retile(extraMg);
         }
     }
 
@@ -3587,12 +3780,18 @@ class KortileApplet extends Applet.IconApplet {
     }
 
     _onWindowMinimizedChanged(win) {
-        // A floating window minimizing/restoring falls through both
-        // branches below as a harmless no-op - it's not tiling-tracked
-        // either way (_isTileable already excludes it, see _trackWindow),
-        // so _managerFor(win) is null in the first branch and _trackWindow
-        // in the second is a no-op for it - only the focus-border update at
-        // the end still applies, same as any other untiled window.
+        // A window that's neither tiled nor floating (fully untracked,
+        // e.g. ignore-listed - _isTileable already excludes those, see
+        // _trackWindow) never reaches this handler at all: it has no
+        // _windowState entry and _attachWindowSignals was never called for
+        // it, so nothing connected notify::minimized here in the first
+        // place (see _watchExtraWindowForMinimize for how *that* case is
+        // covered instead). A floating window does still reach this
+        // handler - _toggleFloating only calls mg.removeWindow(), it never
+        // detaches signals - but _trackWindow's own call in the second
+        // branch below is a no-op for it either way; only the
+        // minimizedExtraManager bookkeeping and the focus-border update at
+        // the end still apply, same as any other untiled window.
         if (win.minimized) {
             const mg = this._managerFor(win);
             if (mg) {
@@ -3605,12 +3804,36 @@ class KortileApplet extends Applet.IconApplet {
                 // that slot at all. Cleared the moment it stops being
                 // minimized, whichever way that happens (see below, and
                 // _onWindowUnmanaged/_untrackWindow/_untrackAll).
-                this._minimizedWindowManager.set(win, mg);
-                this._removedWindowPosition.set(win, { mg, info: mg.removeWindow(win) });
+                const state = this._windowState.get(win);
+                state.minimizedManager = mg;
+                state.removedInfo = { mg, info: mg.removeWindow(win) };
                 this._retile(mg);
+            } else {
+                // Not (or no longer) in any manager - either a genuinely
+                // untracked window (nothing to do, see this method's own
+                // top comment) or a *floating* one, which _toggleFloating
+                // already removed from its manager, so _managerFor can
+                // never find it here even though it's still showing an
+                // extra tab (window-tabs-include-floating-ignored). Same
+                // "remember so the tab survives minimizing" idea as the
+                // branch above, just keyed separately since there's no
+                // real manager membership to hang it off - see
+                // minimizedExtraManager and _collectExtraTabWindows.
+                const state = this._windowState.get(win);
+                if (state && state.floating) {
+                    const extraMg = this._extraTabManagerFor(win);
+                    state.minimizedExtraManager = extraMg;
+                    if (extraMg) this._retile(extraMg);
+                }
             }
         } else {
-            this._minimizedWindowManager.delete(win);
+            const state = this._windowState.get(win);
+            if (state) {
+                state.minimizedManager = null;
+                const extraMg = state.minimizedExtraManager;
+                state.minimizedExtraManager = null;
+                if (extraMg) this._retile(extraMg);
+            }
             // Same race as a brand-new window (see _onWindowCreated): a
             // restored window regaining focus can fire notify::focus-window
             // - and _updateFocusBorder along with it - before this handler
@@ -3636,7 +3859,8 @@ class KortileApplet extends Applet.IconApplet {
                 // Show its actual fullscreen content, not cropped to the
                 // tile slot it just left.
                 this._clearClip(win);
-                this._removedWindowPosition.set(win, { mg, info: mg.removeWindow(win) });
+                const state = this._windowState.get(win);
+                state.removedInfo = { mg, info: mg.removeWindow(win) };
                 this._retile(mg);
             }
         } else {
@@ -3663,11 +3887,12 @@ class KortileApplet extends Applet.IconApplet {
                 // Show its actual maximized content, not cropped to the
                 // tile slot it just left (see _onWindowFullscreenChanged).
                 this._clearClip(win);
-                this._removedWindowPosition.set(win, { mg, info: mg.removeWindow(win) });
+                const state = this._windowState.get(win);
+                state.removedInfo = { mg, info: mg.removeWindow(win) };
                 // Marks it as deliberately untiled while it stays maximized,
-                // same as _floatingWindows does for kb-toggle-floating - see
-                // _nativeMaximizedWindows itself for why this is needed.
-                this._nativeMaximizedWindows.add(win);
+                // same as the floating flag does for kb-toggle-floating -
+                // see the nativeMaximized field itself for why this is needed.
+                state.nativeMaximized = true;
                 this._retile(mg);
             }
         } else {
@@ -3676,7 +3901,8 @@ class KortileApplet extends Applet.IconApplet {
             // before ever being maximized - passing through a maximized
             // state on the way shouldn't silently pull a floating window
             // back into the grid.
-            this._nativeMaximizedWindows.delete(win);
+            const state = this._windowState.get(win);
+            if (state) state.nativeMaximized = false;
             // Grabbing a maximized window's titlebar and dragging it down
             // un-maximizes it *as the move grab starts* - Mutter's own
             // native "unsnap" gesture - with the mouse button still held
@@ -3757,7 +3983,8 @@ class KortileApplet extends Applet.IconApplet {
         // checked on every event, not just at debounce-fire time, since the
         // button may already be released by the time the debounce settles.
         if (this._pointerButtonHeld()) {
-            this._dragFlag.set(win, true);
+            const dragState = this._windowState.get(win);
+            if (dragState) dragState.dragFlag = true;
         }
 
         // The slot clip (see _applyOne) is sized for whatever geometry was
@@ -3776,7 +4003,7 @@ class KortileApplet extends Applet.IconApplet {
         // those would leave it permanently unclipped, since nothing else
         // re-clips a no-op commit (_commitGeometryChange bails out before
         // ever calling _applyOne again if nothing actually changed).
-        const lastApplied = this._lastAppliedRect.get(win);
+        const lastApplied = this._windowState.get(win)?.lastAppliedRect;
         const curRect = win.get_frame_rect();
         const isRealChange =
             !lastApplied ||
@@ -3795,18 +4022,21 @@ class KortileApplet extends Applet.IconApplet {
         // mid-motion (only after the last event does this fire at all).
         this._cancelGeometryDebounce(win);
         const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 60, () => {
-            this._geometryDebounce.delete(win);
+            const s = this._windowState.get(win);
+            if (s) s.geometryDebounce = null;
             this._settleGeometryChange(win);
             return GLib.SOURCE_REMOVE;
         });
-        this._geometryDebounce.set(win, id);
+        const debounceState = this._windowState.get(win);
+        if (debounceState) debounceState.geometryDebounce = id;
     }
 
     _cancelGeometryDebounce(win) {
-        const id = this._geometryDebounce.get(win);
-        if (id) {
+        const state = this._windowState.get(win);
+        const id = state ? state.geometryDebounce : null;
+        if (id != null) {
             GLib.source_remove(id);
-            this._geometryDebounce.delete(win);
+            state.geometryDebounce = null;
         }
     }
 
@@ -3825,7 +4055,7 @@ class KortileApplet extends Applet.IconApplet {
     // here either), then commit once.
     _settleGeometryChange(win) {
         global.log(
-            `[kortile-debug] settle "${win.get_wm_class() || "?"}" buttonHeld=${this._pointerButtonHeld()} dragFlag=${this._dragFlag.get(win) === true}`
+            `[kortile-debug] settle "${win.get_wm_class() || "?"}" buttonHeld=${this._pointerButtonHeld()} dragFlag=${this._windowState.get(win)?.dragFlag === true}`
         );
         if (this._pointerButtonHeld()) {
             this._pollForDragRelease(win);
@@ -3835,11 +4065,12 @@ class KortileApplet extends Applet.IconApplet {
     }
 
     _pollForDragRelease(win) {
-        if (this._releasePoll.has(win)) return;
+        if (this._windowState.get(win)?.releasePoll != null) return;
         let ticks = 0;
         const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
             if (!this.tilingEnabled || !this._managerFor(win)) {
-                this._releasePoll.delete(win);
+                const s = this._windowState.get(win);
+                if (s) s.releasePoll = null;
                 return GLib.SOURCE_REMOVE;
             }
             // 20s safety cap - get_pointer()'s modifier mask has been
@@ -3848,18 +4079,21 @@ class KortileApplet extends Applet.IconApplet {
             // held; commit whatever is current instead of leaving the
             // window unmanaged-by-the-tile indefinitely.
             if (this._pointerButtonHeld() && ++ticks < 400) return GLib.SOURCE_CONTINUE;
-            this._releasePoll.delete(win);
+            const s = this._windowState.get(win);
+            if (s) s.releasePoll = null;
             this._commitGeometryChange(win);
             return GLib.SOURCE_REMOVE;
         });
-        this._releasePoll.set(win, id);
+        const state = this._windowState.get(win);
+        if (state) state.releasePoll = id;
     }
 
     _cancelDragReleasePoll(win) {
-        const id = this._releasePoll.get(win);
-        if (id) {
+        const state = this._windowState.get(win);
+        const id = state ? state.releasePoll : null;
+        if (id != null) {
             GLib.source_remove(id);
-            this._releasePoll.delete(win);
+            state.releasePoll = null;
         }
     }
 
@@ -3878,8 +4112,9 @@ class KortileApplet extends Applet.IconApplet {
         let mg = this._managerFor(win);
         if (!mg) return;
 
-        const wasDragged = this._dragFlag.get(win) === true;
-        this._dragFlag.delete(win);
+        const state = this._windowState.get(win);
+        const wasDragged = state ? state.dragFlag === true : false;
+        if (state) state.dragFlag = false;
         const [pointerX, pointerY] = global.get_pointer();
         global.log(
             `[kortile-debug] commit "${win.get_wm_class() || "?"}" wasDragged=${wasDragged} pointer=(${pointerX},${pointerY})`
@@ -3921,9 +4156,9 @@ class KortileApplet extends Applet.IconApplet {
             return;
         }
 
-        const last = this._lastAppliedRect.get(win);
+        const last = state ? state.lastAppliedRect : null;
         if (!last) {
-            global.log(`[kortile-debug] commit "${win.get_wm_class() || "?"}" no _lastAppliedRect - bailing`);
+            global.log(`[kortile-debug] commit "${win.get_wm_class() || "?"}" no lastAppliedRect - bailing`);
             return;
         }
         const cur = win.get_frame_rect();
@@ -3934,7 +4169,7 @@ class KortileApplet extends Applet.IconApplet {
             `[kortile-debug] commit "${win.get_wm_class() || "?"}" sizeChanged=${sizeChanged} posChanged=${posChanged} cur=(${cur.x},${cur.y},${cur.width}x${cur.height}) last=(${last.x},${last.y},${last.w}x${last.h})`
         );
         if (!sizeChanged && !posChanged) {
-            this._stubbornCount.delete(win); // settled exactly where we put it
+            state.stubbornCount = null; // settled exactly where we put it
             return;
         }
 
@@ -3972,15 +4207,15 @@ class KortileApplet extends Applet.IconApplet {
         // release, without also swallowing a user's own quick series of
         // deliberate manual adjustments (each takes at least a few hundred
         // ms of its own).
-        const entry = this._stubbornCount.get(win) || { count: 0, lastAt: 0 };
+        const entry = state.stubbornCount || { count: 0, lastAt: 0 };
         const now = Date.now();
         const count = now - entry.lastAt < 800 ? entry.count + 1 : 1;
-        this._stubbornCount.set(win, { count, lastAt: now });
+        state.stubbornCount = { count, lastAt: now };
         if (count > 2) {
             global.logWarning(
                 `[${this.uuid}] ${win.get_wm_class()} keeps resisting its tile geometry - leaving it as-is for now`
             );
-            this._lastAppliedRect.set(win, rectFromMeta(cur));
+            state.lastAppliedRect = rectFromMeta(cur);
             return;
         }
 
@@ -4374,7 +4609,7 @@ class KortileApplet extends Applet.IconApplet {
     // With no panel/taskbar on screen, a workspace where every window
     // happens to be minimized has nothing left to click to get anything
     // back, short of Alt+Tab - this is the other way in. Lists exactly the
-    // set _minimizedWindowManager remembers for mg (the same set
+    // set of windows whose _windowState entry has minimizedManager === mg (the same set
     // _reserveWindowTabSpace would offer a tab for, if there were anything
     // left on screen for that tab's strip to attach to), Up/Down to move
     // the selection, Enter or a click to restore and focus it, Escape or a
@@ -4387,8 +4622,8 @@ class KortileApplet extends Applet.IconApplet {
             return;
         }
         const wins = [];
-        for (const [win, ownerMg] of this._minimizedWindowManager) {
-            if (ownerMg === mg) wins.push(win);
+        for (const [win, state] of this._windowState) {
+            if (state.minimizedManager === mg) wins.push(win);
         }
         if (wins.length === 0) return;
         this._openMinimizedSwitcher(mg, wins);
@@ -4536,6 +4771,105 @@ class KortileApplet extends Applet.IconApplet {
         return Clutter.EVENT_PROPAGATE;
     }
 
+    // Non-modal counterpart to _openMinimizedSwitcher/_toggleMinimizedSwitcher
+    // above (the Ctrl+Shift+M popup) - shown automatically, not by keybinding,
+    // whenever a manager has nothing tiled left to attach a tab strip to
+    // (_reserveWindowTabSpace's own bounding box has nothing to anchor on)
+    // but does have minimized windows to get back to. Driven from _retile
+    // itself so it stays in sync with every trigger that already calls that
+    // (minimize/restore/close, layout changes, ...) without needing its own
+    // separate signal hookup. windowTabsAutoMinimizedSwitcher (default on)
+    // gates whether this ever shows anything at all.
+    _updateAutoMinimizedSwitcher(mg) {
+        if (!this.windowTabsAutoMinimizedSwitcher || mg.allWindows().length > 0) {
+            this._hideAutoMinimizedSwitcher(mg);
+            return;
+        }
+        const wins = [];
+        for (const [win, state] of this._windowState) {
+            if (state.minimizedManager === mg) wins.push(win);
+        }
+        if (wins.length === 0) {
+            this._hideAutoMinimizedSwitcher(mg);
+            return;
+        }
+
+        // Rebuilt from scratch every call rather than diffed - only ever
+        // called from _retile, not per-frame, and the row count here is
+        // small, so the simplicity is worth more than the (negligible)
+        // saved work a diff would buy.
+        this._hideAutoMinimizedSwitcher(mg);
+
+        const actor = new St.BoxLayout({
+            vertical: true,
+            style: `spacing: 2px; padding: 4px; min-width: ${MINIMIZED_SWITCHER_MIN_WIDTH}px; background-color: ${this._windowTabBackgroundColor()}; border-radius: 6px;`,
+        });
+        for (const win of wins) actor.add_actor(this._createAutoMinimizedSwitcherRow(win));
+
+        // Non-modal: sits above windows (addChrome, same as the tab strips'
+        // own idiom for staying on top of ordinary window content) but -
+        // unlike Main.pushModal, used for the Ctrl+Shift+M popup above -
+        // never grabs input. affectsInputRegion still lets its own row
+        // buttons receive clicks; everything else (the desktop, panel,
+        // other windows/workspaces) keeps working exactly as if this
+        // weren't showing at all.
+        Main.layoutManager.addChrome(actor, { affectsInputRegion: true, affectsStruts: false });
+
+        const monitor = Main.layoutManager.monitors[mg.monitorIndex] || Main.layoutManager.primaryMonitor;
+        const [, naturalWidth] = actor.get_preferred_width(-1);
+        const [, naturalHeight] = actor.get_preferred_height(naturalWidth);
+        actor.set_position(
+            monitor.x + Math.floor((monitor.width - naturalWidth) / 2),
+            monitor.y + Math.floor((monitor.height - naturalHeight) / 2)
+        );
+
+        this._autoMinimizedSwitchers.set(mg, actor);
+    }
+
+    _hideAutoMinimizedSwitcher(mg) {
+        const actor = this._autoMinimizedSwitchers.get(mg);
+        if (!actor) return;
+        this._autoMinimizedSwitchers.delete(mg);
+        actor.destroy();
+    }
+
+    _destroyAllAutoMinimizedSwitchers() {
+        for (const mg of Array.from(this._autoMinimizedSwitchers.keys())) this._hideAutoMinimizedSwitcher(mg);
+    }
+
+    // Same look as _createMinimizedSwitcherRow's own rows, deliberately not
+    // shared with it: that one's enter-event drives the modal popup's
+    // keyboard-selection highlight via the this._minimizedSwitcher
+    // singleton, which doesn't exist (and shouldn't need to) for this
+    // non-modal, mouse-only, possibly-several-at-once case - hover styling
+    // here is entirely self-contained on the button itself instead.
+    _createAutoMinimizedSwitcherRow(win) {
+        const app = Cinnamon.WindowTracker.get_default().get_window_app(win);
+        const icon = app
+            ? app.create_icon_texture(MINIMIZED_SWITCHER_ICON_SIZE)
+            : new St.Icon({ icon_name: "application-x-executable", icon_size: MINIMIZED_SWITCHER_ICON_SIZE });
+        const label = new St.Label({ text: this._windowTabTitle(win) });
+        label.style = `color: ${this._windowTabForegroundHex()};`;
+        const box = new St.BoxLayout({ style: "spacing: 8px;" });
+        box.add_actor(icon);
+        box.add_actor(label);
+
+        const btn = new St.Button({ child: box, reactive: true, track_hover: true, x_expand: true, x_fill: true });
+        const restyle = () => {
+            const alpha = btn.hover ? 0.28 : 0.06;
+            btn.style = `padding: ${MINIMIZED_SWITCHER_ROW_PADDING}px; border-radius: 4px; background-color: ${this._windowTabForegroundRgba(alpha)};`;
+        };
+        restyle();
+        btn.connect("notify::hover", restyle);
+        // No _closeMinimizedSwitcher-equivalent needed here first - unlike
+        // that modal popup, there's nothing to explicitly tear down: once
+        // win is restored, its manager's next _retile (which restoring
+        // always triggers) finds allWindows().length > 0 again and
+        // _updateAutoMinimizedSwitcher hides this on its own.
+        btn.connect("clicked", () => this._activateAndRaise(win));
+        return btn;
+    }
+
     // Same idea as other tiling WMs' "toggle floating": pull the focused
     // window out of the grid (it keeps whatever geometry it currently has,
     // free to move/resize normally) without touching its neighbors' layout
@@ -4547,9 +4881,16 @@ class KortileApplet extends Applet.IconApplet {
     _toggleFloating(win) {
         const mg = this._managerFor(win);
         if (mg) {
-            this._removedWindowPosition.set(win, { mg, info: mg.removeWindow(win) });
+            const state = this._windowState.get(win);
+            state.removedInfo = { mg, info: mg.removeWindow(win) };
+            // Set before retiling, not after - window-tabs-include-floating-
+            // ignored reads this same flag (see _collectExtraTabWindows)
+            // from inside _retile() below, and needs to see it as already
+            // floating on this very first retile to merge it into a group
+            // right away instead of only catching up on some later,
+            // unrelated retile.
+            state.floating = true;
             this._retile(mg);
-            this._floatingWindows.add(win);
             // A tiled window's actor carries a permanent Clutter clip sized
             // to its slot (see _applyOne) - leaving it on here would crop
             // any part of the window that grows past those old bounds the
@@ -4565,8 +4906,9 @@ class KortileApplet extends Applet.IconApplet {
         // Only re-tile a window *this* toggle floated - one that's untracked
         // for some other reason (ignore-list, a dialog, ...) is left alone,
         // same as it would be for any other window that isn't tracked.
-        if (!this._floatingWindows.has(win)) return;
-        this._floatingWindows.delete(win);
+        const state = this._windowState.get(win);
+        if (!state || !state.floating) return;
+        state.floating = false;
         this._trackWindow(win, true, true);
         this._updateFocusBorder();
     }
