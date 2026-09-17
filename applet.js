@@ -1870,13 +1870,62 @@ class KortileApplet extends Applet.IconApplet {
             }
         }
 
+        const stripY = atBottom ? maxY - stripHeight : minY;
+
+        // vertical-left/-right sit master and slave side by side, with a
+        // real `gap` between their columns - the strip should break there
+        // too instead of bridging over it. horizontal-top/-bottom stack
+        // them top/bottom instead, so their split is vertical - a
+        // horizontal strip has no side-by-side gap of its own to mirror -
+        // and maximized/single-window has no split at all. Falls through to
+        // the single combined strip below whenever either master's or
+        // slave's rect isn't available to split against.
+        const masters = mg.masters, slaves = mg.slaves;
+        if (mg.layout.startsWith("vertical") && masters.length > 0 && slaves.length > 0) {
+            const masterRect = rects.get(masters[0]);
+            const slaveRect = rects.get(slaves[0]);
+            if (masterRect && slaveRect) {
+                // A window not currently tiled (minimized, or floating/
+                // ignored via window-tabs-include-floating-ignored) has no
+                // rect of its own to place by - removedInfo.info.kind
+                // (set by Manager.removeWindow(), see
+                // _onWindowMinimizedChanged/_toggleFloating) is the same
+                // "which side was it on" record restoreWindow() already
+                // relies on to put it back, reused here instead of tracking
+                // a separate copy. Defaults to master for a window that's
+                // never actually been tiled at all (ignore-listed only).
+                const zoneOf = (w) => {
+                    if (masters.includes(w)) return "master";
+                    if (slaves.includes(w)) return "slave";
+                    const info = this._windowState.get(w)?.removedInfo?.info;
+                    return info?.kind === "slave" ? "slave" : "master";
+                };
+                const byZone = { master: [], slave: [] };
+                for (const w of combined) byZone[zoneOf(w)].push(w);
+
+                const zoneRects = { master: masterRect, slave: slaveRect };
+                const groups = [];
+                for (const zone of ["master", "slave"]) {
+                    if (byZone[zone].length === 0) continue;
+                    const key = `${mg.workspaceIndex}:${mg.monitorIndex}:${zone}`;
+                    groups.push({
+                        key,
+                        wmClass: "",
+                        windows: this._orderWindowTabGroup(key, byZone[zone]),
+                        rect: { x: zoneRects[zone].x, y: stripY, w: zoneRects[zone].w, h: stripHeight },
+                    });
+                }
+                return groups;
+            }
+        }
+
         const key = `${mg.workspaceIndex}:${mg.monitorIndex}:all`;
         return [
             {
                 key,
                 wmClass: "",
                 windows: this._orderWindowTabGroup(key, combined),
-                rect: { x: minX, y: atBottom ? maxY - stripHeight : minY, w: maxX - minX, h: stripHeight },
+                rect: { x: minX, y: stripY, w: maxX - minX, h: stripHeight },
             },
         ];
     }
