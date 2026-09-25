@@ -81,8 +81,9 @@ any time a window seems to have drifted out of tracking).
   computed slot size - the slot's Clutter clip still crops it to the intended
   bounds, so it won't visually overlap its neighbor, but its content will look
   cropped instead. This is inherent to those apps, not a bug in the tiling math.
-- Only one instance of this applet should be added to a panel - it manages
-  window state for the whole desktop, not per-instance. Running it alongside
+- Only one instance of this applet can be added (enforced via
+  `max-instances` in metadata.json) - it manages window state for the
+  whole desktop, not per-instance. Running it alongside
   a standalone X11 tiling tool at the same time will make them fight over
   the same windows; use one or the other per session, not both.
 

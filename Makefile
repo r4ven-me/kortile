@@ -13,7 +13,9 @@ FORK_DIR         := .spice-fork
 SPICE_DIR     := $(FORK_DIR)/$(UUID)
 FILES_DIR     := $(SPICE_DIR)/files/$(UUID)
 
-APPLET_FILES  := applet.js manager.js manager.test.js tabs.js tabs.test.js \
+# Only what the applet needs at runtime - the *.test.js files stay in this
+# repo (see `make test`) and aren't shipped to end users via Spices.
+APPLET_FILES  := applet.js manager.js tabs.js \
                  metadata.json settings-schema.json icon_dark.svg icon_light.svg
 
 .PHONY: help release test spice-clone spice-sync spice-validate spice-diff spice-update spice-commit spice-push spice-publish spice-sync-upstream spice-status spice-clean
@@ -21,7 +23,7 @@ APPLET_FILES  := applet.js manager.js manager.test.js tabs.js tabs.test.js \
 help:
 	@echo "  make test               run manager.test.js + tabs.test.js"
 	@echo "  make release            the everything button: test, commit + push"
-	@echo "                          THIS repo, clone the fork if it isn't yet,"
+	@echo "                          THIS repo (tracked files only), clone the fork if it isn't yet,"
 	@echo "                          sync it with upstream, then sync/validate/"
 	@echo "                          commit/push this applet's own change into"
 	@echo "                          it too - stops at the first failure"
@@ -76,14 +78,24 @@ test:
 # still require one) - falls back to "Release vX.Y.Z" straight from
 # metadata.json's own version when not given.
 #
+# Only changes to files git already tracks are committed (`commit -a`, not
+# `add -A`) - a stray untracked file lying around in the working tree
+# (scratch notes, a local build, ...) would otherwise be swept into the
+# release commit and pushed. New files have to be `git add`-ed by hand
+# first; release lists any it sees so that's never silently missed.
+#
 # Commit and push are two separate checks on purpose - confirmed live
 # `git status --porcelain` alone (only uncommitted working-tree changes)
 # silently skipped the push entirely whenever the tree was already clean,
 # even with real local commits sitting unpushed (no upstream configured at
 # all counts as exactly that, same as a normal branch that's just ahead).
 release: test
-	@if [ -n "$$(git status --porcelain)" ]; then \
-		git add -A && git commit -m "$(if $(MSG),$(MSG),Release v$(VERSION))"; \
+	@if [ -n "$$(git ls-files --others --exclude-standard)" ]; then \
+		echo "Untracked files NOT included in this release (git add them first if they should be):"; \
+		git ls-files --others --exclude-standard | sed 's/^/  /'; \
+	fi
+	@if [ -n "$$(git status --porcelain --untracked-files=no)" ]; then \
+		git commit -a -m "$(if $(MSG),$(MSG),Release v$(VERSION))"; \
 	else \
 		echo "Nothing uncommitted in this repo."; \
 	fi
@@ -112,6 +124,7 @@ spice-clone:
 
 spice-sync: _require-clone
 	@mkdir -p "$(FILES_DIR)"
+	@rm -f "$(FILES_DIR)"/*.test.js
 	@for f in $(APPLET_FILES); do cp "$$f" "$(FILES_DIR)/"; done
 	@cp spice/icon.png "$(FILES_DIR)/icon.png"
 	@cp spice/info.json "$(SPICE_DIR)/info.json"
