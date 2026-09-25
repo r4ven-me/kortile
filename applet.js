@@ -270,6 +270,11 @@ class KortileApplet extends Applet.IconApplet {
         this._pendingTrack = new Set(); // Meta.Window -> created but not tracked yet, see _onWindowCreated
         this._floatingWindowSizes = new Map(); // wm_class -> {w,h}, see remember-floating-window-size-enabled
         this._floatingSizeDebounce = new Map(); // wm_class -> GLib timeout id, see _onFloatingWindowSizeChanged
+        this._floatingSizeSignals = new Map(); // Meta.Window -> [signal ids] for floating-size memory, see _onWindowCreated
+        // Set once on_applet_removed_from_panel runs - any callback still
+        // queued from this (now dead) instance checks it and bails, so a
+        // reload never leaves two instances fighting over the same windows.
+        this._destroyed = false;
         this._workspaceSwitchRetileId = null; // GLib timeout id, see _onWorkspaceSwitched
         this._globalSignals = [];
         this._kbNames = [];
@@ -370,7 +375,6 @@ class KortileApplet extends Applet.IconApplet {
             "altDragMoveResizeEnabled",
             this._onAltDragMoveResizeSettingChanged.bind(this)
         );
-        this._applyAltDragMoveResizeSetting();
         this._settings.bind(
             "focus-follows-mouse-enabled",
             "focusFollowsMouseEnabled",
@@ -379,14 +383,23 @@ class KortileApplet extends Applet.IconApplet {
         this._settings.bind(
             "focus-follows-mouse-raise-enabled",
             "focusFollowsMouseRaiseEnabled",
-            this._onFocusFollowsMouseSettingChanged.bind(this)
+            this._onFocusFollowsMouseRaiseSettingChanged.bind(this)
         );
         this._settings.bind(
             "focus-follows-mouse-raise-delay",
             "focusFollowsMouseRaiseDelay",
-            this._onFocusFollowsMouseSettingChanged.bind(this)
+            this._onFocusFollowsMouseRaiseDelaySettingChanged.bind(this)
         );
-        this._applyFocusFollowsMouseSetting();
+        // Raw JSON, {"<wm pref key>": "<GVariant text>", ...} - the user's
+        // own system values from right before one of the toggles above
+        // first overrode them, so turning that toggle back off can put
+        // them back exactly (see _overrideWmPrefs/_restoreWmPrefs). Hidden
+        // like remembered-layouts. The toggles themselves are deliberately
+        // *not* applied here at startup: they only ever touch the system
+        // prefs when the user actually flips one, so merely installing or
+        // reloading the applet never overwrites whatever the user already
+        // chose in Cinnamon's own Windows settings.
+        this._settings.bind("saved-wm-prefs", "savedWmPrefsRaw", null);
         this._settings.bind("focus-border-enabled", "focusBorderEnabled", this._onFocusBorderSettingChanged.bind(this));
         this._settings.bind("focus-border-color", "focusBorderColor", this._onFocusBorderStyleSettingChanged.bind(this));
         this._settings.bind("focus-border-width", "focusBorderWidth", this._onFocusBorderStyleSettingChanged.bind(this));
@@ -523,6 +536,16 @@ class KortileApplet extends Applet.IconApplet {
     }
 
     on_applet_removed_from_panel() {
+        this._destroyed = true;
+        // Both are self-rescheduling/deferred GLib sources that would
+        // otherwise keep calling into this dead instance after a reload -
+        // the sweep in particular would re-track and retile every window
+        // every 3s, fighting the fresh instance that replaced this one.
+        this._stopUntrackedWindowSweep();
+        for (const id of this._floatingSizeDebounce.values()) GLib.source_remove(id);
+        this._floatingSizeDebounce.clear();
+        for (const [win, ids] of this._floatingSizeSignals) for (const id of ids) win.disconnect(id);
+        this._floatingSizeSignals.clear();
         this._stopWindowPicker();
         this._closeMinimizedSwitcher();
         this._unbindKeybindings();
@@ -763,9 +786,14 @@ class KortileApplet extends Applet.IconApplet {
     // is to be able to exclude windows kortile is currently tiling too.
     _anyWindowAtPoint(point) {
         let found = null;
+        const activeWs = global.workspace_manager.get_active_workspace();
         for (const actor of global.get_window_actors()) {
             const win = actor.get_meta_window();
             if (win.get_window_type() !== Meta.WindowType.NORMAL) continue;
+            // Only what's actually visible under the pointer - a minimized
+            // window, or one on another workspace, still keeps its frame
+            // rect and would otherwise win the hit-test invisibly.
+            if (win.minimized || !win.located_on_workspace(activeWs)) continue;
             const r = win.get_frame_rect();
             if (point.x >= r.x && point.x < r.x + r.width && point.y >= r.y && point.y < r.y + r.height) {
                 found = win; // get_window_actors() is bottom-to-top, keep the topmost match
@@ -3455,16 +3483,62 @@ class KortileApplet extends Applet.IconApplet {
     // active (confirmed live), and a permanent modal grab would swallow all
     // other input - not viable for an always-on toggle.
     _onAltDragMoveResizeSettingChanged() {
-        this._applyAltDragMoveResizeSetting();
+        if (this.altDragMoveResizeEnabled) {
+            this._overrideWmPrefs({
+                "mouse-button-modifier": new GLib.Variant("s", "<Alt>"),
+                "resize-with-right-button": new GLib.Variant("b", true),
+            });
+        } else {
+            this._restoreWmPrefs(["mouse-button-modifier", "resize-with-right-button"]);
+        }
     }
 
-    _applyAltDragMoveResizeSetting() {
-        if (this.altDragMoveResizeEnabled) {
-            this._wmPrefs.set_string("mouse-button-modifier", "<Alt>");
-            this._wmPrefs.set_boolean("resize-with-right-button", true);
-        } else {
-            this._wmPrefs.set_string("mouse-button-modifier", "");
+    _loadSavedWmPrefs() {
+        try {
+            const parsed = JSON.parse(this.savedWmPrefsRaw || "{}");
+            return parsed && typeof parsed === "object" ? parsed : {};
+        } catch (e) {
+            return {};
         }
+    }
+
+    _storeSavedWmPrefs(saved) {
+        this.savedWmPrefsRaw = JSON.stringify(saved);
+        this._settings.setValue("saved-wm-prefs", this.savedWmPrefsRaw);
+    }
+
+    // Sets each wm pref in values (key -> GLib.Variant), first remembering
+    // the user's current value for any key not already remembered - so
+    // re-enabling a toggle never overwrites the real original with
+    // kortile's own earlier override.
+    _overrideWmPrefs(values) {
+        const saved = this._loadSavedWmPrefs();
+        for (const [key, variant] of Object.entries(values)) {
+            if (!(key in saved)) saved[key] = this._wmPrefs.get_value(key).print(true);
+            this._wmPrefs.set_value(key, variant);
+        }
+        this._storeSavedWmPrefs(saved);
+    }
+
+    // Puts back whatever _overrideWmPrefs remembered for each key, or the
+    // schema's own default if nothing was remembered (e.g. the toggle was
+    // turned on by an older kortile that didn't save originals yet).
+    _restoreWmPrefs(keys) {
+        const saved = this._loadSavedWmPrefs();
+        for (const key of keys) {
+            let restored = false;
+            if (key in saved) {
+                try {
+                    this._wmPrefs.set_value(key, GLib.Variant.parse(null, saved[key], null, null));
+                    restored = true;
+                } catch (e) {
+                    global.logWarning(`[${this.uuid}] couldn't restore ${key}: ${e}`);
+                }
+                delete saved[key];
+            }
+            if (!restored) this._wmPrefs.reset(key);
+        }
+        this._storeSavedWmPrefs(saved);
     }
 
     // "Focus follows mouse" and "auto-raise" are both Cinnamon/Muffin's own
@@ -3485,16 +3559,28 @@ class KortileApplet extends Applet.IconApplet {
     // while the raise toggle is on (auto-raise only ever fires for a focus
     // change that happened *without* a click, i.e. hover focus - Cinnamon
     // doesn't enforce that dependency itself, turning the delay up with
-    // raise off just does nothing), but is still applied unconditionally
-    // here regardless of either toggle, same as Cinnamon's own Windows
-    // settings panel does it.
+    // raise off just does nothing), but is still applied whenever it's
+    // changed here regardless of either toggle, same as Cinnamon's own
+    // Windows settings panel does it. Turning a toggle off puts back the
+    // value the user had before turning it on (see _restoreWmPrefs), not
+    // a hardcoded one.
     _onFocusFollowsMouseSettingChanged() {
-        this._applyFocusFollowsMouseSetting();
+        if (this.focusFollowsMouseEnabled) {
+            this._overrideWmPrefs({ "focus-mode": new GLib.Variant("s", "mouse") });
+        } else {
+            this._restoreWmPrefs(["focus-mode"]);
+        }
     }
 
-    _applyFocusFollowsMouseSetting() {
-        this._wmPrefs.set_string("focus-mode", this.focusFollowsMouseEnabled ? "mouse" : "click");
-        this._wmPrefs.set_boolean("auto-raise", this.focusFollowsMouseRaiseEnabled);
+    _onFocusFollowsMouseRaiseSettingChanged() {
+        if (this.focusFollowsMouseRaiseEnabled) {
+            this._overrideWmPrefs({ "auto-raise": new GLib.Variant("b", true) });
+        } else {
+            this._restoreWmPrefs(["auto-raise"]);
+        }
+    }
+
+    _onFocusFollowsMouseRaiseDelaySettingChanged() {
         this._wmPrefs.set_int("auto-raise-delay", this.focusFollowsMouseRaiseDelay);
     }
 
@@ -3548,9 +3634,6 @@ class KortileApplet extends Applet.IconApplet {
 
     _onWindowCreated(display, metaWindow) {
         if (!this.tilingEnabled) return;
-        const _dbgT0 = GLib.get_monotonic_time();
-        const _dbgName = `${metaWindow.get_wm_class() || "?"}/${metaWindow.get_title() || "?"}`;
-        global.log(`[kortile-debug] created "${_dbgName}" hasActorNow=${!!metaWindow.get_compositor_private()}`);
 
         // A brand-new window very often already holds focus before this
         // even starts, and tracking is deliberately deferred below (needs
@@ -3602,8 +3685,7 @@ class KortileApplet extends Applet.IconApplet {
             // cleared this entry is exactly the signal that happened -
             // bail out instead of guessing whether whatever's left of the
             // window can still be safely touched.
-            if (!this._pendingTrack.has(metaWindow)) return;
-            global.log(`[kortile-debug] track() firing for "${_dbgName}" +${(GLib.get_monotonic_time() - _dbgT0) / 1000}ms`);
+            if (this._destroyed || !this._pendingTrack.has(metaWindow)) return;
             this._pendingTrack.delete(metaWindow);
             this._applyWorkspaceRule(metaWindow);
             this._trackWindow(metaWindow, true, true);
@@ -3612,7 +3694,15 @@ class KortileApplet extends Applet.IconApplet {
             // no-op while tiled, so a window later toggled floating
             // (kb-toggle-floating) starts being remembered from its very
             // next resize without needing its own separate hookup there.
-            metaWindow.connect("size-changed", () => this._onFloatingWindowSizeChanged(metaWindow));
+            // Tracked separately from _windowSignals (which only exists for
+            // tracked windows) so it can still be disconnected on reload,
+            // and forgotten on unmanage, for a window that never gets tiled.
+            if (!this._floatingSizeSignals.has(metaWindow)) {
+                this._floatingSizeSignals.set(metaWindow, [
+                    metaWindow.connect("size-changed", () => this._onFloatingWindowSizeChanged(metaWindow)),
+                    metaWindow.connect("unmanaged", () => this._floatingSizeSignals.delete(metaWindow)),
+                ]);
+            }
             if (this._shouldRememberFloatingSize(metaWindow)) this._applyRememberedFloatingSize(metaWindow);
             // Re-checks even for a window that stays untracked (ignored,
             // not tileable, ...) - it should get the border like any other
@@ -3627,21 +3717,15 @@ class KortileApplet extends Applet.IconApplet {
             // the exact same full-area rect), which would otherwise leave
             // the border stuck showing with nothing left to correct it.
             this._updateFocusBorder();
-            global.log(
-                `[kortile-debug] track() done for "${_dbgName}" +${(GLib.get_monotonic_time() - _dbgT0) / 1000}ms borderVisible=${this._focusBorder.actor.visible}`
-            );
         };
         const actor = metaWindow.get_compositor_private();
         if (actor) {
             const id = actor.connect("first-frame", () => {
-                global.log(`[kortile-debug] first-frame for "${_dbgName}" +${(GLib.get_monotonic_time() - _dbgT0) / 1000}ms`);
                 actor.disconnect(id);
                 track();
             });
         } else {
-            global.log(`[kortile-debug] no actor yet for "${_dbgName}", falling back to 50ms timer`);
             GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
-                global.log(`[kortile-debug] 50ms fallback firing for "${_dbgName}" +${(GLib.get_monotonic_time() - _dbgT0) / 1000}ms`);
                 track();
                 return GLib.SOURCE_REMOVE;
             });
@@ -4123,9 +4207,6 @@ class KortileApplet extends Applet.IconApplet {
     // actually come up instead (polled, since grab-op-end isn't reliable
     // here either), then commit once.
     _settleGeometryChange(win) {
-        global.log(
-            `[kortile-debug] settle "${win.get_wm_class() || "?"}" buttonHeld=${this._pointerButtonHeld()} dragFlag=${this._windowState.get(win)?.dragFlag === true}`
-        );
         if (this._pointerButtonHeld()) {
             this._pollForDragRelease(win);
             return;
@@ -4185,9 +4266,6 @@ class KortileApplet extends Applet.IconApplet {
         const wasDragged = state ? state.dragFlag === true : false;
         if (state) state.dragFlag = false;
         const [pointerX, pointerY] = global.get_pointer();
-        global.log(
-            `[kortile-debug] commit "${win.get_wm_class() || "?"}" wasDragged=${wasDragged} pointer=(${pointerX},${pointerY})`
-        );
 
         // win.get_monitor() picks whichever monitor has the *largest
         // overlap area* with the window's own frame rect (confirmed live
@@ -4214,9 +4292,6 @@ class KortileApplet extends Applet.IconApplet {
         const ws = win.get_workspace();
         const wsIndex = this._wsIndexForMonitor(monIndex, ws ? ws.index() : mg.workspaceIndex);
         if (monIndex !== mg.monitorIndex || wsIndex !== mg.workspaceIndex) {
-            global.log(
-                `[kortile-debug] commit "${win.get_wm_class() || "?"}" monitor/workspace mismatch (monIndex=${monIndex} vs mg=${mg.monitorIndex}, wsIndex=${wsIndex} vs mg=${mg.workspaceIndex}) - reassigning manager, no swap attempted`
-            );
             mg.removeWindow(win);
             this._retile(mg);
             mg = this._getOrCreateManager(wsIndex, monIndex);
@@ -4227,23 +4302,18 @@ class KortileApplet extends Applet.IconApplet {
 
         const last = state ? state.lastAppliedRect : null;
         if (!last) {
-            global.log(`[kortile-debug] commit "${win.get_wm_class() || "?"}" no lastAppliedRect - bailing`);
             return;
         }
         const cur = win.get_frame_rect();
 
         const sizeChanged = cur.width !== last.w || cur.height !== last.h;
         const posChanged = cur.x !== last.x || cur.y !== last.y;
-        global.log(
-            `[kortile-debug] commit "${win.get_wm_class() || "?"}" sizeChanged=${sizeChanged} posChanged=${posChanged} cur=(${cur.x},${cur.y},${cur.width}x${cur.height}) last=(${last.x},${last.y},${last.w}x${last.h})`
-        );
         if (!sizeChanged && !posChanged) {
             state.stubbornCount = null; // settled exactly where we put it
             return;
         }
 
         if (!wasDragged) {
-            global.log(`[kortile-debug] commit "${win.get_wm_class() || "?"}" not detected as a drag - snapping back to tile`);
             // Nothing the user did caused this - most commonly an app
             // asynchronously moving/resizing itself back to its own
             // preferred geometry a moment after being tiled (confirmed on
@@ -4289,7 +4359,6 @@ class KortileApplet extends Applet.IconApplet {
         }
 
         if (sizeChanged) {
-            global.log(`[kortile-debug] commit "${win.get_wm_class() || "?"}" sizeChanged branch - proportion update, no swap`);
             // Manually resizing a tiled window's edge translates the drag
             // into a proportion change instead of just fighting it back to
             // the old size: either the master/slave divide, or (if there
@@ -4316,9 +4385,6 @@ class KortileApplet extends Applet.IconApplet {
             // hasn't moved between the two, no reason to risk the two
             // decisions disagreeing over a read taken microseconds apart.
             const target = this._windowAtPoint(mg, { x: pointerX, y: pointerY }, win);
-            global.log(
-                `[kortile-debug] commit "${win.get_wm_class() || "?"}" posChanged branch - swap target=${target ? target.get_wm_class() || "?" : "none"}`
-            );
             // Group-aware (see Manager.swap) - dropping onto a window that
             // shares its slot with others (same app, round-robined
             // together) swaps win with that *whole slot*, not just the one
@@ -5050,7 +5116,7 @@ class KortileApplet extends Applet.IconApplet {
     _startUntrackedWindowSweep() {
         if (this._untrackedSweepId) return;
         this._untrackedSweepId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 3, () => {
-            if (!this.tilingEnabled) {
+            if (this._destroyed || !this.tilingEnabled) {
                 this._untrackedSweepId = null;
                 return GLib.SOURCE_REMOVE;
             }

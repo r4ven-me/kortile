@@ -94,7 +94,6 @@ class FocusBorder {
         // flash, not just a stale-until-corrected state. Wait for that to
         // resolve either way instead of guessing.
         if (a._pendingTrack.has(win)) {
-            global.log(`[kortile-debug] _updateFocusBorder: still pending, hiding border for "${win.get_wm_class() || "?"}"`);
             this.hide();
             return;
         }

@@ -151,17 +151,21 @@
         "type": "generic",
         "default": "{}"
     },
+    "saved-wm-prefs": {
+        "type": "generic",
+        "default": "{}"
+    },
     "alt-drag-move-resize-enabled": {
         "type": "switch",
         "default": false,
         "description": "Alt + drag to move or resize a window",
-        "tooltip": "Alt + left-drag moves the window from anywhere on it. Alt + right-drag resizes it, but needs to actually grab a corner (Mutter itself ignores a click too close to the center - no grab starts at all) - and on a tiled window, only a corner shared with another tile (not the outer screen edge) actually sticks, same rule as dragging a tile's real edge by hand. This is Cinnamon's own built-in WM feature (Settings → Windows → modifier key), this toggle just flips it on/off system-wide - turning it back off here always clears the modifier to none, regardless of what it was before enabling."
+        "tooltip": "Alt + left-drag moves the window from anywhere on it. Alt + right-drag resizes it, but needs to actually grab a corner (Mutter itself ignores a click too close to the center - no grab starts at all) - and on a tiled window, only a corner shared with another tile (not the outer screen edge) actually sticks, same rule as dragging a tile's real edge by hand. This is Cinnamon's own built-in WM feature (Settings → Windows → modifier key), this toggle just flips it on/off system-wide - turning it back off here restores whatever modifier you had before enabling it."
     },
     "focus-follows-mouse-enabled": {
         "type": "switch",
         "default": false,
         "description": "Focus a window by hovering over it",
-        "tooltip": "This is Cinnamon's own built-in WM feature (Settings → Windows → focus mode), this toggle just flips it on/off - sets focus-mode to \"mouse\" (hovering a window focuses it, and moving off any window onto bare desktop/panel unfocuses everything) while on, back to \"click\" (the default) while off, regardless of what it was set to before enabling. Independent of the \"bring to front\" toggle below - Cinnamon lets you focus a hovered window without necessarily raising it, this is that same choice."
+        "tooltip": "This is Cinnamon's own built-in WM feature (Settings → Windows → focus mode), this toggle just flips it on/off - sets focus-mode to \"mouse\" (hovering a window focuses it, and moving off any window onto bare desktop/panel unfocuses everything) while on, and back to whatever it was before enabling while off. Independent of the \"bring to front\" toggle below - Cinnamon lets you focus a hovered window without necessarily raising it, this is that same choice."
     },
     "focus-follows-mouse-raise-enabled": {
         "type": "switch",
@@ -177,7 +181,7 @@
         "step": 100,
         "units": "ms",
         "description": "Delay before a hovered window is raised",
-        "tooltip": "Also Cinnamon's own built-in WM feature (Settings → Windows → \"Delay before raising focused window\"), only meaningful while \"Also bring a hovered window to the front\" above is on - this just exposes that same auto-raise-delay pref here instead of needing to go find it in Cinnamon's own Windows settings separately. Applied regardless of either toggle above, same as Cinnamon's own Windows settings panel does it."
+        "tooltip": "Also Cinnamon's own built-in WM feature (Settings → Windows → \"Delay before raising focused window\"), only meaningful while \"Also bring a hovered window to the front\" above is on - this just exposes that same auto-raise-delay pref here instead of needing to go find it in Cinnamon's own Windows settings separately. Applied whenever changed here, regardless of either toggle above, same as Cinnamon's own Windows settings panel does it."
     },
     "window-tabs-enabled": {
         "type": "switch",
