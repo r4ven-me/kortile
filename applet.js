@@ -2172,6 +2172,21 @@ class KortileApplet extends Applet.IconApplet {
             if (onActiveWorkspace) entry.actor.show();
             else entry.actor.hide();
         }
+        for (const [mg, actor] of this._autoMinimizedSwitchers) {
+            if (this._isAutoMinimizedSwitcherVisible(mg)) actor.show();
+            else actor.hide();
+        }
+    }
+
+    // Auto minimized-window lists (see _updateAutoMinimizedSwitcher) are
+    // addChrome actors, visible on every workspace by default - unlike tab
+    // strips there's no window_group stacking to hide them behind, so each
+    // one has to be shown only while its own manager's workspace is the
+    // active one (overview/expo hiding is handled alongside the tab strips,
+    // see _hideAllWindowTabStripsForOverview).
+    _isAutoMinimizedSwitcherVisible(mg) {
+        const activeWs = global.workspace_manager.get_active_workspace_index();
+        return mg.workspaceIndex === -1 || mg.workspaceIndex === activeWs;
     }
 
     // Keeps a strip's actual Clutter stacking position in sync with real
@@ -3393,6 +3408,7 @@ class KortileApplet extends Applet.IconApplet {
 
     _hideAllWindowTabStripsForOverview() {
         for (const entry of this._windowTabGroups.values()) entry.actor.hide();
+        for (const actor of this._autoMinimizedSwitchers.values()) actor.hide();
     }
 
     _disconnectGlobalSignals() {
@@ -4959,6 +4975,7 @@ class KortileApplet extends Applet.IconApplet {
         );
 
         this._autoMinimizedSwitchers.set(mg, actor);
+        if (!this._isAutoMinimizedSwitcherVisible(mg) || Main.overview.visible || Main.expo.visible) actor.hide();
     }
 
     _hideAutoMinimizedSwitcher(mg) {

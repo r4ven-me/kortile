@@ -123,8 +123,10 @@ spice-clone:
 # --- day to day --------------------------------------------------------------
 
 spice-sync: _require-clone
+	@# Recreated from scratch so a file removed/renamed here (tabs.js,
+	@# the old *.test.js copies, ...) doesn't linger in the fork forever.
+	@rm -rf "$(FILES_DIR)"
 	@mkdir -p "$(FILES_DIR)"
-	@rm -f "$(FILES_DIR)"/*.test.js
 	@for f in $(APPLET_FILES); do cp "$$f" "$(FILES_DIR)/"; done
 	@cp spice/icon.png "$(FILES_DIR)/icon.png"
 	@cp spice/info.json "$(SPICE_DIR)/info.json"
