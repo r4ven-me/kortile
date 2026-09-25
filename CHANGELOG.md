@@ -23,6 +23,9 @@
 
 ### Fixed
 
+- A newly opened floating/ignored window (with "Include floating/ignored
+  windows in tabs" on) now shows up in the tab strip right away, instead
+  of only after focus moved to a tiled window.
 - The automatic minimized-window list no longer stays on screen after
   switching to another workspace, or over the overview/expo.
 

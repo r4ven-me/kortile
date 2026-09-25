@@ -1213,6 +1213,22 @@ class KortileApplet extends Applet.IconApplet {
         return null;
     }
 
+    // Retiles win's extra-tab manager if win should have a tab there (see
+    // window-tabs-include-floating-ignored) but isn't in any strip yet -
+    // _collectExtraTabWindows only picks extras up during a retile, and
+    // nothing about an untiled window appearing triggers one on its own.
+    // No-op for tiled windows and ones already shown, so it's cheap to call
+    // from creation and focus changes.
+    _refreshExtraWindowTab(win) {
+        if (!this.windowTabsEnabled || !this.windowTabsIncludeFloatingIgnored) return;
+        if (!win || this._managerFor(win) || !this._isWindowTabEligible(win)) return;
+        for (const entry of this._windowTabGroups.values()) {
+            if (entry.buttons.has(win)) return;
+        }
+        const mg = this._extraTabManagerFor(win);
+        if (mg) this._retile(mg);
+    }
+
     // Which manager a window's own tab strip would belong to, purely by
     // workspace/monitor - unlike _managerFor, this doesn't require the
     // window to actually be tiled there. Used for floating/ignored windows
@@ -3454,6 +3470,11 @@ class KortileApplet extends Applet.IconApplet {
                 // of how it got focused.
                 win.raise();
                 this._retile(mg);
+            } else if (win && !mg) {
+                // Focusing an untiled window never retiles anything above -
+                // catch an eligible extra that isn't in its strip yet (e.g.
+                // it only became eligible after it was created).
+                this._refreshExtraWindowTab(win);
             }
         }
         this._updateWindowTabHighlights();
@@ -3705,6 +3726,11 @@ class KortileApplet extends Applet.IconApplet {
             this._pendingTrack.delete(metaWindow);
             this._applyWorkspaceRule(metaWindow);
             this._trackWindow(metaWindow, true, true);
+            // _trackWindow only retiles when it actually tiles the window -
+            // a new floating/ignored/untileable one would otherwise only show
+            // up in its strip at the next unrelated retile (typically a focus
+            // change onto a tiled window).
+            this._refreshExtraWindowTab(metaWindow);
             // Connected unconditionally, whether or not this window ends up
             // tiled - _shouldRememberFloatingSize is what keeps this a
             // no-op while tiled, so a window later toggled floating
