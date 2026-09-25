@@ -25,11 +25,15 @@ any time a window seems to have drifted out of tracking).
 - **Master/slave counts**: configurable master count and visible-slave
   count; extra windows beyond the visible count round-robin onto the
   existing slots.
-- **Window tabs**: when several windows of the same app round-robin into
-  one slot, an optional small strip of buttons appears above it so you can
-  see and switch between them, instead of them silently stacking. Configurable:
-  minimum window count before it shows, icons-only vs. icons-with-titles,
-  left/center/right position, custom colors. Tabs can be renamed
+- **Window tabs**: an optional strip of buttons, one per window on that
+  workspace/monitor, spanning the tiled area (split at the master/slave gap
+  in vertical layouts), so windows sharing a slot are visible and
+  switchable instead of silently stacking. Shown once there are at least
+  two windows. Configurable: top/bottom side, icons-only vs.
+  icons-with-titles, icon and font size, custom colors, and optionally
+  including floating/ignored windows. If every tiled window there is
+  minimized, a small list of the minimized windows appears instead (can
+  be turned off; Ctrl+Shift+M opens it manually). Tabs can be renamed
   (double-click, icons-with-titles style) and dragged to reorder;
   middle-click closes a tab's window. Strips stay out of the way of the
   panel, Cinnamon's overview, and any window they don't manage that happens

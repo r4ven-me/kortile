@@ -2,7 +2,29 @@
 
 ## Unreleased
 
+### Added
+
+- Window tabs: one shared strip per workspace/monitor covering every
+  window there (split at the master/slave gap in vertical layouts), with
+  equal-width tabs and ellipsized titles.
+- Option to include floating/ignored windows in the tab strip.
+- Tab icon size and title font size settings.
+- An automatic list of minimized windows when every tiled window on a
+  workspace/monitor is minimized (can be turned off).
+
+### Removed
+
+- Tab settings "Tab grouping", minimum window count, strip position and
+  "Stretch tab strip" (the strip now always spans the tiled area).
+
+### Changed
+
+- Focus border moved into its own `focus-border.js`.
+
 ### Fixed
+
+- The automatic minimized-window list no longer stays on screen after
+  switching to another workspace, or over the overview/expo.
 
 - Reloading the applet ("Restart Kortile", Cinnamon's own Reload, or
   removing it from the panel) no longer leaves the old instance running
@@ -25,7 +47,9 @@
 
 - `metadata.json` sets `"max-instances": 1`, so Cinnamon itself stops a
   second copy from being added to a panel.
-- `make spice-sync` no longer ships the `*.test.js` files to Spices.
+- `make spice-sync` no longer ships the `*.test.js` files to Spices, and
+  rebuilds the applet folder in the fork from scratch so removed files
+  (e.g. the old `tabs.js`) don't linger there.
 - `make release` commits only files git already tracks (and lists any
   untracked ones) instead of `git add -A`.
 
